@@ -174,7 +174,7 @@ Telegram-Leecher/
 
 ## License
 
-This project is for personal use. Add a license file if you plan to distribute it.
+MIT License — see [LICENSE](LICENSE).
 
 ## Author
 
