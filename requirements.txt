@@ -1,0 +1,6 @@
+pyrogram>=2.0.106
+tgcrypto
+aiogram>=3.13.0
+python-dotenv>=1.0.0
+pydantic-settings>=2.0.0
+certifi>=2024.0.0
