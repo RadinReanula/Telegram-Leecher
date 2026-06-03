@@ -10,8 +10,11 @@ from pyrogram.errors import FloodWait
 from app.config import Settings
 from app.downloader.results import DownloadOutcome
 from app.downloader.service import DownloadService
+from app.queue.exceptions import JobCancelledError
 from app.queue.models import DownloadJob, JobStage, JobStatus
 from app.queue.status_format import format_job_status
+
+_CANCEL_MESSAGE = "Cancelled by user (/stop)."
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,8 @@ class JobQueue:
         self._running_by_user: defaultdict[int, int] = defaultdict(int)
         self._jobs_by_user: defaultdict[int, list[str]] = defaultdict(list)
         self._enqueue_count = 0
+        self._cancelled_ids: set[str] = set()
+        self._running_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def start(self) -> None:
         if self._workers:
@@ -110,13 +115,63 @@ class JobQueue:
         running = len(self._running_ids)
         return pending, running, len(self._jobs)
 
+    async def cancel_jobs_for_user(self, user_id: int) -> tuple[int, int]:
+        """Cancel queued and running jobs for one user. Returns (pending, running) counts."""
+        to_finalize: list[DownloadJob] = []
+        tasks_to_cancel: list[asyncio.Task[None]] = []
+        cancelled_pending = 0
+        cancelled_running = 0
+
+        async with self._lock:
+            for job in self.jobs_for_user(user_id, include_finished=False):
+                job_id = job.id
+                self._cancelled_ids.add(job_id)
+                is_running = job_id in self._running_ids
+
+                if is_running:
+                    task = self._running_tasks.get(job_id)
+                    if task is not None and not task.done():
+                        tasks_to_cancel.append(task)
+                    cancelled_running += 1
+                    continue
+
+                if job_id in self._pending:
+                    self._pending.remove(job_id)
+                    self._pending_by_user[user_id] -= 1
+                    if self._pending_by_user[user_id] <= 0:
+                        del self._pending_by_user[user_id]
+                cancelled_pending += 1
+                to_finalize.append(job)
+
+        for task in tasks_to_cancel:
+            task.cancel()
+
+        for job in to_finalize:
+            await self._finalize_cancelled(job)
+
+        return cancelled_pending, cancelled_running
+
+    async def _finalize_cancelled(self, job: DownloadJob) -> None:
+        if job.is_finished:
+            return
+        job.status = JobStatus.CANCELLED
+        job.stage = JobStage.CANCELLED
+        job.error = _CANCEL_MESSAGE
+        job.finished_at = time.time()
+        await self._refresh_status_message(job, force=True)
+
     async def _worker_loop(self, worker_index: int) -> None:
         while True:
             job_id = await self._queue.get()
             try:
                 if job_id is None:
                     break
-                await self._run_job(job_id)
+                task = asyncio.create_task(self._run_job(job_id))
+                self._running_tasks[job_id] = task
+                try:
+                    await task
+                finally:
+                    self._running_tasks.pop(job_id, None)
             finally:
                 self._queue.task_done()
 
@@ -128,14 +183,32 @@ class JobQueue:
         if not job:
             return
 
+        if job.is_finished:
+            self._cancelled_ids.discard(job_id)
+            return
+
+        skip_run = False
         async with self._lock:
-            if job_id in self._pending:
-                self._pending.remove(job_id)
-            self._pending_by_user[job.requester_id] -= 1
-            if self._pending_by_user[job.requester_id] <= 0:
-                del self._pending_by_user[job.requester_id]
-            self._running_ids.add(job_id)
-            self._running_by_user[job.requester_id] += 1
+            if job_id in self._cancelled_ids:
+                self._cancelled_ids.discard(job_id)
+                if job_id in self._pending:
+                    self._pending.remove(job_id)
+                    self._pending_by_user[job.requester_id] -= 1
+                    if self._pending_by_user[job.requester_id] <= 0:
+                        del self._pending_by_user[job.requester_id]
+                skip_run = True
+            else:
+                if job_id in self._pending:
+                    self._pending.remove(job_id)
+                self._pending_by_user[job.requester_id] -= 1
+                if self._pending_by_user[job.requester_id] <= 0:
+                    del self._pending_by_user[job.requester_id]
+                self._running_ids.add(job_id)
+                self._running_by_user[job.requester_id] += 1
+
+        if skip_run:
+            await self._finalize_cancelled(job)
+            return
 
         job.status = JobStatus.RUNNING
         job.started_at = time.time()
@@ -155,6 +228,9 @@ class JobQueue:
                 job.stage = JobStage.UPLOADING
             self._schedule_status_refresh(job)
 
+        def is_cancelled() -> bool:
+            return job_id in self._cancelled_ids or job.is_finished
+
         flood_retries = 0
         try:
             while True:
@@ -166,6 +242,7 @@ class JobQueue:
                         on_progress=on_progress,
                         expand_media_group=self._expand_media_group_for_job(job),
                         parsed=job.parsed,
+                        is_cancelled=is_cancelled,
                     )
                     break
                 except FloodWait as exc:
@@ -208,6 +285,12 @@ class JobQueue:
                 job.error = result.message
 
             await self._refresh_status_message(job, force=True)
+        except JobCancelledError:
+            self._cancelled_ids.discard(job_id)
+            await self._finalize_cancelled(job)
+        except asyncio.CancelledError:
+            self._cancelled_ids.discard(job_id)
+            await self._finalize_cancelled(job)
         except Exception:
             logger.exception("Job %s failed for link %s", job.id, job.link)
             job.status = JobStatus.FAILED
@@ -240,7 +323,12 @@ class JobQueue:
         now = time.time()
         last = self._last_status_edit.get(job.id, 0)
         if not force and (now - last) < self._settings.status_update_interval_sec:
-            if job.stage not in {JobStage.DONE, JobStage.SKIPPED, JobStage.FAILED}:
+            if job.stage not in {
+                JobStage.DONE,
+                JobStage.SKIPPED,
+                JobStage.FAILED,
+                JobStage.CANCELLED,
+            }:
                 return
 
         prefix = {
@@ -249,6 +337,7 @@ class JobQueue:
             JobStatus.COMPLETED: "✅",
             JobStatus.FAILED: "❌",
             JobStatus.SKIPPED: "⏭️",
+            JobStatus.CANCELLED: "🛑",
         }[job.status]
         body = format_job_status(job)
         text = f"{prefix} {body}"

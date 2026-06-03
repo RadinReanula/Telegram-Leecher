@@ -45,6 +45,7 @@ def create_router(
             "   • https://t.me/c/1867392134/42 (private)\n\n"
             "Commands:\n"
             "/status — your jobs summary\n"
+            "/stop — cancel your queued and running downloads\n"
             "/job <id> — full details for one job\n"
             "/queue — global queue summary\n"
             "/auth — check user session status\n"
@@ -61,7 +62,8 @@ def create_router(
             "Each link gets its own status message with progress and timestamps. "
             "Links without media are skipped automatically. "
             f"Maximum {settings.max_links_per_message} links per message. "
-            "Use /job <id> for full job details."
+            "Use /job <id> for full job details. "
+            "Use /stop to cancel all your active downloads."
         )
 
     @router.message(Command("auth"))
@@ -80,6 +82,31 @@ def create_router(
 
         jobs = job_queue.jobs_for_user(message.from_user.id, include_finished=True)[:15]
         await message.answer(format_status_list(jobs))
+
+    @router.message(Command("stop"))
+    async def cmd_stop(message: Message) -> None:
+        if not is_allowed(message.from_user.id):
+            await message.answer("You are not authorized to use this bot.")
+            return
+
+        cancelled_pending, cancelled_running = await job_queue.cancel_jobs_for_user(
+            message.from_user.id
+        )
+        total = cancelled_pending + cancelled_running
+        if total == 0:
+            await message.answer("No queued or running jobs to stop.")
+            return
+
+        parts: list[str] = []
+        if cancelled_pending:
+            parts.append(f"{cancelled_pending} queued")
+        if cancelled_running:
+            parts.append(f"{cancelled_running} running")
+        summary = " and ".join(parts)
+        await message.answer(
+            f"Stopped {summary} job(s).\n"
+            "The bot is still running — you can paste new links anytime."
+        )
 
     @router.message(Command("job"))
     async def cmd_job(message: Message) -> None:

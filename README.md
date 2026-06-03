@@ -102,6 +102,7 @@ Open your bot in Telegram → `/start` → paste message link(s).
 | `/help` | Short help |
 | `/auth` | User session status |
 | `/status` | Your jobs summary |
+| `/stop` | Cancel all your queued and running download jobs (bot keeps running) |
 | `/job <id>` | Full details for one job |
 | `/queue` | Global queue summary |
 | Paste link(s) | Enqueue download(s) |
@@ -114,6 +115,7 @@ Send multiple links in one message (spaces or newlines, up to `MAX_LINKS_PER_MES
 - One status message per link
 - Jobs run sequentially by default (`QUEUE_WORKERS=1`)
 - Batch jobs fetch **only the linked message**, not the full album (avoids duplicates)
+- Send `/stop` to cancel all your active jobs without restarting the bot (queued jobs stop immediately; a file currently downloading may finish that file first)
 
 ## Configuration
 

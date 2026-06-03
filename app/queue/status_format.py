@@ -25,6 +25,7 @@ def format_job_status(job: DownloadJob, *, compact: bool = False) -> str:
             JobStatus.COMPLETED: "✅",
             JobStatus.FAILED: "❌",
             JobStatus.SKIPPED: "⏭️",
+            JobStatus.CANCELLED: "🛑",
         }[job.status]
         detail = job.result or job.error or job.stage.value
         if len(detail) > 40:

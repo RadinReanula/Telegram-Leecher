@@ -27,6 +27,7 @@ from app.downloader.video_metadata import (
     extract_video_params,
 )
 from app.parser.telegram_links import ParsedLink, parse_telegram_link
+from app.queue.exceptions import JobCancelledError
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +51,15 @@ class DownloadService:
         *,
         expand_media_group: bool = True,
         parsed: ParsedLink | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> DownloadResult:
         def report(stage: str, progress: int = 0, display_name: str | None = None) -> None:
             if on_progress:
                 on_progress(stage, progress, display_name)
+
+        def check_cancelled() -> None:
+            if is_cancelled and is_cancelled():
+                raise JobCancelledError
 
         if parsed is None:
             try:
@@ -61,6 +67,7 @@ class DownloadService:
             except ValueError as exc:
                 return DownloadResult(DownloadOutcome.SKIPPED, str(exc))
 
+        check_cancelled()
         report("resolving", 0, _display_name_from_parsed(parsed))
 
         try:
@@ -76,6 +83,7 @@ class DownloadService:
         if isinstance(fetch_result, DownloadResult):
             return fetch_result
 
+        check_cancelled()
         messages = fetch_result
         media_messages = [message for message in messages if message.media]
         if not media_messages:
@@ -92,6 +100,7 @@ class DownloadService:
             bot_chat_id=bot_chat_id,
             report=report,
             display_name=display_name,
+            is_cancelled=is_cancelled,
         )
 
         report("uploading", 100, display_name)
@@ -110,6 +119,7 @@ class DownloadService:
         bot_chat_id: int,
         report: Callable[[str, int, str | None], None],
         display_name: str | None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> int:
         total = len(media_messages)
         if total > 1 and self._settings.album_pipeline:
@@ -119,6 +129,7 @@ class DownloadService:
                 bot_chat_id=bot_chat_id,
                 report=report,
                 display_name=display_name,
+                is_cancelled=is_cancelled,
             )
         return await self._process_album_sequential(
             media_messages,
@@ -126,6 +137,7 @@ class DownloadService:
             bot_chat_id=bot_chat_id,
             report=report,
             display_name=display_name,
+            is_cancelled=is_cancelled,
         )
 
     async def _process_album_sequential(
@@ -136,10 +148,13 @@ class DownloadService:
         bot_chat_id: int,
         report: Callable[[str, int, str | None], None],
         display_name: str | None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> int:
         delivered = 0
         total = len(media_messages)
         for index, message in enumerate(media_messages):
+            if is_cancelled and is_cancelled():
+                raise JobCancelledError
             pct = int((index / total) * 90) if total > 1 else 0
             report("downloading", pct, display_name)
             if await self._process_one_media_item(
@@ -160,12 +175,15 @@ class DownloadService:
         bot_chat_id: int,
         report: Callable[[str, int, str | None], None],
         display_name: str | None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> int:
         total = len(media_messages)
         delivered = 0
         upload_task: asyncio.Task[bool] | None = None
 
         for index, message in enumerate(media_messages):
+            if is_cancelled and is_cancelled():
+                raise JobCancelledError
             pct = int((index / total) * 90)
             report("downloading", pct, display_name)
             path = await self._download_message(

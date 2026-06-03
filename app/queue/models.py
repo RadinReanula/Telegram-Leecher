@@ -12,6 +12,7 @@ class JobStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    CANCELLED = "cancelled"
 
 
 class JobStage(str, Enum):
@@ -22,6 +23,7 @@ class JobStage(str, Enum):
     DONE = "done"
     SKIPPED = "skipped"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass(slots=True)
@@ -47,7 +49,12 @@ class DownloadJob:
 
     @property
     def is_finished(self) -> bool:
-        return self.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.SKIPPED}
+        return self.status in {
+            JobStatus.COMPLETED,
+            JobStatus.FAILED,
+            JobStatus.SKIPPED,
+            JobStatus.CANCELLED,
+        }
 
     @property
     def batch_label(self) -> str | None:
