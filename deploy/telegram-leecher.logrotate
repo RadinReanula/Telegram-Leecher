@@ -1,0 +1,9 @@
+/var/log/telegram-leecher/*.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

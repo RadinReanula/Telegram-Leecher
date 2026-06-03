@@ -1,0 +1,21 @@
+[Unit]
+Description=Telegram Leecher bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rdvps
+Group=rdvps
+WorkingDirectory=/home/rdvps/projects/Telegram-Leecher-Source
+ExecStart=/home/rdvps/projects/Telegram-Leecher-Source/.venv/bin/python -m app.main
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+StandardOutput=append:/var/log/telegram-leecher/app.log
+StandardError=append:/var/log/telegram-leecher/app.log
+
+[Install]
+WantedBy=multi-user.target
