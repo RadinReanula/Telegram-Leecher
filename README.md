@@ -69,11 +69,31 @@ Stages shown while running: `resolving` → `downloading` → `uploading`.
 
 ## Requirements
 
-- Python 3.11+ (tested on 3.13)
+### System
+
+- Python **3.11+** (tested on 3.13)
 - Windows, macOS, or Linux (VPS: see [DEPLOY.md](DEPLOY.md))
 - Telegram [API_ID / API_HASH](https://my.telegram.org/apps)
 - Bot token from [@BotFather](https://t.me/BotFather)
-- On Windows: [MSVC Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) if `tgcrypto` has no prebuilt wheel
+- On Windows: [MSVC Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) if `tgcrypto` has no prebuilt wheel for your Python version
+
+No separate install for **ffmpeg**, **Redis**, or a database — the bot uses only Python packages and Telegram APIs.
+
+### Python packages
+
+Install everything with `pip install -r requirements.txt`. Direct dependencies:
+
+| Package | Role in this project |
+|---------|----------------------|
+| `pyrogram` | User-session downloads |
+| `tgcrypto` | Fast Pyrogram crypto (optional speedup; needs a C compiler if no wheel) |
+| `aiogram` | Bot commands, messages, uploads under 50 MB |
+| `pydantic` | Settings validation (`app/config.py`) |
+| `pydantic-settings` | Load `.env` into settings |
+| `python-dotenv` | `.env` file support (used by pydantic-settings) |
+| `certifi` | CA bundle for Bot API HTTPS (`BOT_SSL_VERIFY`) |
+
+`aiohttp` / `aiofiles` (aiogram HTTP) and `pyaes` / `pysocks` (Pyrogram) install automatically as transitive deps.
 
 ## Quick start
 
@@ -92,10 +112,19 @@ cd Telegram-Leecher
 
 ### 3. Configure environment
 
-```bash
-cp .env.example .env
-# Edit .env — never commit this file
+```powershell
+# Windows
+copy .env.example .env
 ```
+
+```bash
+# macOS / Linux
+cp .env.example .env
+```
+
+Edit `.env` with your credentials — never commit this file.
+
+`sessions/` and `tmp/` are created automatically on first `login.py` / bot run (no manual `mkdir`).
 
 ### 4. Install and log in
 
