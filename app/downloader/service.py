@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -32,8 +33,33 @@ from app.queue.exceptions import JobCancelledError
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[str, int, str | None], None]
+GodProgressCallback = Callable[[str, int, str | None, dict[str, int]], None]
 
 _MIN_VIDEO_BYTES = 4096
+
+_AUDIO_MIMES = frozenset(
+    {
+        "audio/mpeg",
+        "audio/mp3",
+        "audio/wav",
+        "audio/x-wav",
+        "audio/aac",
+        "audio/flac",
+        "audio/x-flac",
+        "audio/ogg",
+    }
+)
+_AUDIO_SUFFIXES = frozenset({".mp3", ".wav", ".aac", ".flac"})
+_IMAGE_MIMES = frozenset(
+    {
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+    }
+)
+_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp"})
+_VIDEO_SUFFIXES = frozenset({".mov", ".mkv", ".avi", ".webm", ".mp4"})
 
 
 class DownloadService:
@@ -41,6 +67,8 @@ class DownloadService:
         self._user = user_client
         self._bot = bot
         self._settings = settings
+        # (requester_id, chat_id, media_group_id) — short-lived album dedupe for batch jobs
+        self._claimed_media_groups: dict[tuple[int, int, str], float] = {}
 
     async def process_link(
         self,
@@ -79,6 +107,7 @@ class DownloadService:
             chat_id,
             parsed.message_id,
             expand_media_group=expand_media_group,
+            requester_id=requester_id,
         )
         if isinstance(fetch_result, DownloadResult):
             return fetch_result
@@ -110,6 +139,212 @@ class DownloadService:
         else:
             msg = f"Done — {delivered} files sent (album)."
         return DownloadResult(DownloadOutcome.SUCCESS, msg, display_name=display_name)
+
+    async def process_god_crawl(
+        self,
+        requester_id: int,
+        bot_chat_id: int,
+        link: str,
+        *,
+        direction: str,
+        start_id: int,
+        parsed: ParsedLink | None = None,
+        on_progress: GodProgressCallback | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> DownloadResult:
+        def check_cancelled() -> None:
+            if is_cancelled and is_cancelled():
+                raise JobCancelledError
+
+        if direction not in {"up", "down"}:
+            return DownloadResult(DownloadOutcome.FAILED, "God direction must be up or down.")
+
+        if parsed is None:
+            try:
+                parsed = parse_telegram_link(link)
+            except ValueError as exc:
+                return DownloadResult(DownloadOutcome.SKIPPED, str(exc))
+
+        check_cancelled()
+        display_name = f"God {direction} · {_display_name_from_parsed(parsed)}"
+
+        def report(stage: str, progress: int, counters: dict[str, int]) -> None:
+            if on_progress:
+                on_progress(stage, progress, display_name, counters)
+
+        try:
+            chat_id = await resolve_chat_id(self._user, parsed)
+        except ValueError as exc:
+            return DownloadResult(DownloadOutcome.FAILED, str(exc), display_name=display_name)
+
+        scanned = 0
+        downloaded = 0
+        skipped = 0
+        missing = 0
+        consecutive_miss = 0
+        seen_groups: set[str] = set()
+        max_messages = self._settings.god_max_messages
+        max_miss = self._settings.god_max_consecutive_miss
+        delay = self._settings.god_delay_sec
+        flood_extra = self._settings.god_floodwait_extra_sec
+        skip_seen_groups = self._settings.god_skip_already_seen_groups
+
+        msg_id = start_id
+        while scanned < max_messages:
+            check_cancelled()
+            if direction == "down" and msg_id < 1:
+                break
+
+            counters = {
+                "scanned": scanned,
+                "downloaded": downloaded,
+                "skipped": skipped,
+                "missing": missing,
+                "current_id": msg_id,
+                "miss_streak": consecutive_miss,
+            }
+            progress = min(99, int((scanned / max_messages) * 100)) if max_messages else 0
+            report("downloading", progress, counters)
+
+            try:
+                message = await self._user.get_messages(chat_id, msg_id)
+            except FloodWait as exc:
+                logger.info(
+                    "God crawl FloodWait %ss at msg %s — sleeping",
+                    exc.value,
+                    msg_id,
+                )
+                await asyncio.sleep(exc.value + flood_extra)
+                continue
+            except (PeerIdInvalid, ChannelPrivate):
+                return DownloadResult(
+                    DownloadOutcome.FAILED,
+                    "Cannot access this chat. Join with your authorized account first.",
+                    display_name=display_name,
+                )
+            except MessageIdInvalid:
+                missing += 1
+                consecutive_miss += 1
+                scanned += 1
+                if direction == "up" and consecutive_miss >= max_miss:
+                    break
+                msg_id = msg_id + 1 if direction == "up" else msg_id - 1
+                await asyncio.sleep(delay)
+                continue
+            except RPCError as exc:
+                logger.warning("God crawl RPC error at msg %s: %s", msg_id, exc)
+                missing += 1
+                consecutive_miss += 1
+                scanned += 1
+                if direction == "up" and consecutive_miss >= max_miss:
+                    break
+                msg_id = msg_id + 1 if direction == "up" else msg_id - 1
+                await asyncio.sleep(delay)
+                continue
+
+            scanned += 1
+
+            if not message or getattr(message, "empty", False):
+                missing += 1
+                consecutive_miss += 1
+                if direction == "up" and consecutive_miss >= max_miss:
+                    break
+                msg_id = msg_id + 1 if direction == "up" else msg_id - 1
+                await asyncio.sleep(delay)
+                continue
+
+            consecutive_miss = 0
+            group_id = str(message.media_group_id) if message.media_group_id else None
+
+            if group_id and skip_seen_groups and group_id in seen_groups:
+                skipped += 1
+                msg_id = msg_id + 1 if direction == "up" else msg_id - 1
+                await asyncio.sleep(delay)
+                continue
+
+            try:
+                if message.media_group_id:
+                    try:
+                        media_messages = await self._user.get_media_group(chat_id, msg_id)
+                    except FloodWait as exc:
+                        await asyncio.sleep(exc.value + flood_extra)
+                        continue
+                    except (MessageIdInvalid, RPCError):
+                        media_messages = [message] if message.media else []
+                    if group_id:
+                        seen_groups.add(group_id)
+                else:
+                    media_messages = [message] if message.media else []
+            except FloodWait as exc:
+                await asyncio.sleep(exc.value + flood_extra)
+                continue
+
+            media_messages = [m for m in media_messages if m.media]
+            if not media_messages:
+                skipped += 1
+                msg_id = msg_id + 1 if direction == "up" else msg_id - 1
+                await asyncio.sleep(delay)
+                continue
+
+            check_cancelled()
+            item_name = _display_name_from_message(media_messages[0])
+
+            def item_report(stage: str, pct: int, _name: str | None = None) -> None:
+                report(
+                    stage,
+                    min(99, progress),
+                    {
+                        "scanned": scanned,
+                        "downloaded": downloaded,
+                        "skipped": skipped,
+                        "missing": missing,
+                        "current_id": msg_id,
+                        "miss_streak": consecutive_miss,
+                    },
+                )
+
+            try:
+                delivered = await self._process_media_messages(
+                    media_messages,
+                    requester_id=requester_id,
+                    bot_chat_id=bot_chat_id,
+                    report=item_report,
+                    display_name=item_name,
+                    is_cancelled=is_cancelled,
+                )
+                downloaded += delivered
+                if delivered == 0:
+                    skipped += 1
+            except FloodWait as exc:
+                logger.info("God crawl FloodWait during media %ss", exc.value)
+                await asyncio.sleep(exc.value + flood_extra)
+                continue
+            except JobCancelledError:
+                raise
+            except Exception:
+                logger.exception("God crawl failed processing msg %s", msg_id)
+                skipped += 1
+
+            msg_id = msg_id + 1 if direction == "up" else msg_id - 1
+            await asyncio.sleep(delay)
+
+        final = (
+            f"God {direction} done — scanned {scanned}, sent {downloaded}, "
+            f"skipped {skipped}, missing {missing}."
+        )
+        report(
+            "uploading",
+            100,
+            {
+                "scanned": scanned,
+                "downloaded": downloaded,
+                "skipped": skipped,
+                "missing": missing,
+                "current_id": msg_id,
+                "miss_streak": consecutive_miss,
+            },
+        )
+        return DownloadResult(DownloadOutcome.SUCCESS, final, display_name=display_name)
 
     async def _process_media_messages(
         self,
@@ -282,6 +517,7 @@ class DownloadService:
         message_id: int,
         *,
         expand_media_group: bool,
+        requester_id: int | None = None,
     ) -> list[PyrogramMessage] | DownloadResult:
         try:
             message = await self._user.get_messages(chat_id, message_id)
@@ -316,24 +552,60 @@ class DownloadService:
                     "No media on this message (album caption-only anchor).",
                 )
 
-            if message.media:
-                try:
-                    return await self._user.get_media_group(chat_id, message_id)
-                except MessageIdInvalid:
-                    return DownloadResult(
-                        DownloadOutcome.SKIPPED,
-                        "Message not found — check the link.",
-                    )
-                except RPCError as exc:
-                    return DownloadResult(DownloadOutcome.FAILED, f"Telegram error: {exc}")
+            group_key = str(message.media_group_id)
+            if requester_id is not None and not self._claim_media_group(
+                requester_id, chat_id, group_key
+            ):
+                return DownloadResult(
+                    DownloadOutcome.SKIPPED,
+                    "Album already downloaded in this batch.",
+                    display_name=_display_name_from_message(message),
+                )
+
             try:
                 return await self._user.get_media_group(chat_id, message_id)
             except MessageIdInvalid:
-                return DownloadResult(DownloadOutcome.SKIPPED, "Message not found — check the link.")
+                self._release_media_group(requester_id, chat_id, group_key)
+                return DownloadResult(
+                    DownloadOutcome.SKIPPED,
+                    "Message not found — check the link.",
+                )
             except RPCError as exc:
+                self._release_media_group(requester_id, chat_id, group_key)
                 return DownloadResult(DownloadOutcome.FAILED, f"Telegram error: {exc}")
 
         return [message]
+
+    def _claim_media_group(self, requester_id: int, chat_id: int, media_group_id: str) -> bool:
+        """Return True if this album is newly claimed; False if already handled."""
+        self._prune_claimed_media_groups()
+        key = (requester_id, chat_id, media_group_id)
+        if key in self._claimed_media_groups:
+            return False
+        self._claimed_media_groups[key] = time.monotonic()
+        return True
+
+    def _release_media_group(
+        self,
+        requester_id: int | None,
+        chat_id: int,
+        media_group_id: str,
+    ) -> None:
+        if requester_id is None:
+            return
+        self._claimed_media_groups.pop((requester_id, chat_id, media_group_id), None)
+
+    def _prune_claimed_media_groups(self, *, max_age_sec: float = 3600.0) -> None:
+        if len(self._claimed_media_groups) < 200:
+            return
+        now = time.monotonic()
+        stale = [k for k, ts in self._claimed_media_groups.items() if now - ts > max_age_sec]
+        for key in stale:
+            del self._claimed_media_groups[key]
+        if len(self._claimed_media_groups) > 500:
+            ordered = sorted(self._claimed_media_groups.items(), key=lambda item: item[1])
+            for key, _ in ordered[: len(ordered) // 2]:
+                del self._claimed_media_groups[key]
 
     async def _download_message(
         self,
@@ -443,6 +715,31 @@ class DownloadService:
         if request_timeout is not None:
             kwargs["request_timeout"] = request_timeout
 
+        try:
+            await self._send_via_bot_typed(
+                bot_chat_id,
+                input_file,
+                message,
+                caption,
+                kwargs=kwargs,
+                thumb_path=thumb_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Typed bot send failed (%s), falling back to document", exc)
+            await self._bot.send_document(
+                bot_chat_id, input_file, caption=caption, **kwargs
+            )
+
+    async def _send_via_bot_typed(
+        self,
+        bot_chat_id: int,
+        input_file: FSInputFile,
+        message: PyrogramMessage,
+        caption: str | None,
+        *,
+        kwargs: dict,
+        thumb_path: Path | None = None,
+    ) -> None:
         if message.video_note:
             note_kwargs: dict = {}
             if message.video_note.duration:
@@ -452,28 +749,39 @@ class DownloadService:
             await self._bot.send_video_note(
                 bot_chat_id, input_file, **kwargs, **note_kwargs
             )
-        elif message.animation:
+            return
+
+        if message.animation or _is_gif_document(message):
             anim_kwargs = build_telegram_video_kwargs(extract_video_params(message))
             if thumb_path:
                 anim_kwargs["thumbnail"] = FSInputFile(thumb_path)
             await self._bot.send_animation(
                 bot_chat_id, input_file, caption=caption, **kwargs, **anim_kwargs
             )
-        elif _is_streamable_video(message):
+            return
+
+        if _is_streamable_video(message):
             video_kwargs = build_telegram_video_kwargs(extract_video_params(message))
             if thumb_path:
                 video_kwargs["thumbnail"] = FSInputFile(thumb_path)
             await self._bot.send_video(
                 bot_chat_id, input_file, caption=caption, **kwargs, **video_kwargs
             )
-        elif message.voice:
+            return
+
+        if message.voice:
             await self._bot.send_voice(bot_chat_id, input_file, caption=caption, **kwargs)
-        elif message.audio:
+            return
+
+        if message.audio or _is_audio_document(message):
             await self._bot.send_audio(bot_chat_id, input_file, caption=caption, **kwargs)
-        elif message.photo:
+            return
+
+        if message.photo or _is_image_document(message):
             await self._bot.send_photo(bot_chat_id, input_file, caption=caption, **kwargs)
-        else:
-            await self._bot.send_document(bot_chat_id, input_file, caption=caption, **kwargs)
+            return
+
+        await self._bot.send_document(bot_chat_id, input_file, caption=caption, **kwargs)
 
     async def _send_via_user(
         self,
@@ -488,6 +796,29 @@ class DownloadService:
         note = f"File {reason}."
         full_caption = f"{note}\n\n{caption}" if caption else note
 
+        try:
+            await self._send_via_user_typed(
+                requester_id,
+                path,
+                message,
+                full_caption,
+                thumb_path=thumb_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Typed user send failed (%s), falling back to document", exc)
+            await self._user.send_document(
+                requester_id, document=str(path), caption=full_caption
+            )
+
+    async def _send_via_user_typed(
+        self,
+        requester_id: int,
+        path: Path,
+        message: PyrogramMessage,
+        full_caption: str,
+        *,
+        thumb_path: Path | None = None,
+    ) -> None:
         if message.video_note:
             note_kwargs: dict = {"caption": full_caption}
             if message.video_note.duration:
@@ -497,7 +828,7 @@ class DownloadService:
             await self._user.send_video_note(requester_id, video_note=str(path), **note_kwargs)
             return
 
-        if message.animation:
+        if message.animation or _is_gif_document(message):
             params = extract_video_params(message)
             anim_kwargs = build_telegram_video_kwargs(params)
             if thumb_path:
@@ -521,6 +852,18 @@ class DownloadService:
             )
             return
 
+        if message.voice:
+            await self._user.send_voice(requester_id, voice=str(path), caption=full_caption)
+            return
+
+        if message.audio or _is_audio_document(message):
+            await self._user.send_audio(requester_id, audio=str(path), caption=full_caption)
+            return
+
+        if message.photo or _is_image_document(message):
+            await self._user.send_photo(requester_id, photo=str(path), caption=full_caption)
+            return
+
         await self._user.send_document(requester_id, document=str(path), caption=full_caption)
 
     @staticmethod
@@ -535,23 +878,87 @@ class DownloadService:
         return "\n\n".join(parts)
 
 
+def _document_mime(message: PyrogramMessage) -> str | None:
+    document = message.document
+    if document and document.mime_type:
+        return document.mime_type.lower()
+    return None
+
+
+def _document_name(message: PyrogramMessage) -> str | None:
+    document = message.document
+    if document and document.file_name:
+        return document.file_name
+    return None
+
+
+def _document_suffix(message: PyrogramMessage) -> str:
+    name = _document_name(message)
+    if name:
+        return Path(name).suffix.lower()
+    return ""
+
+
+def _is_audio_document(message: PyrogramMessage) -> bool:
+    if not message.document:
+        return False
+    mime = _document_mime(message)
+    if mime and (mime in _AUDIO_MIMES or mime.startswith("audio/")):
+        return True
+    return _document_suffix(message) in _AUDIO_SUFFIXES
+
+
+def _is_gif_document(message: PyrogramMessage) -> bool:
+    if not message.document:
+        return False
+    mime = _document_mime(message)
+    if mime == "image/gif":
+        return True
+    return _document_suffix(message) == ".gif"
+
+
+def _is_image_document(message: PyrogramMessage) -> bool:
+    if not message.document or message.sticker:
+        return False
+    if _is_gif_document(message):
+        return False
+    mime = _document_mime(message)
+    if mime and mime in _IMAGE_MIMES:
+        return True
+    return _document_suffix(message) in _IMAGE_SUFFIXES - {".gif"}
+
+
 def _is_streamable_video(message: PyrogramMessage) -> bool:
     if message.video:
         return True
-    document = message.document
-    return bool(document and document.mime_type and document.mime_type.startswith("video/"))
+    if not message.document:
+        return False
+    if _is_audio_document(message) or _is_image_document(message) or _is_gif_document(message):
+        return False
+    mime = _document_mime(message)
+    if mime and mime.startswith("video/"):
+        return True
+    return _document_suffix(message) in _VIDEO_SUFFIXES
 
 
 def _should_attach_thumbnail(message: PyrogramMessage) -> bool:
     return bool(
-        message.video or message.animation or _is_streamable_video(message)
+        message.video
+        or message.animation
+        or _is_gif_document(message)
+        or _is_streamable_video(message)
     )
 
 
 def _media_suffix(message: PyrogramMessage) -> str:
     if message.video or message.video_note:
+        name = message.video.file_name if message.video and message.video.file_name else None
+        if name:
+            return Path(name).suffix or ".mp4"
         return ".mp4"
     if message.animation:
+        if message.animation.file_name:
+            return Path(message.animation.file_name).suffix or ".mp4"
         return ".mp4"
     if message.photo:
         return ".jpg"
@@ -560,12 +967,21 @@ def _media_suffix(message: PyrogramMessage) -> str:
     if message.voice:
         return ".ogg"
     if message.document:
-        if message.document.mime_type and message.document.mime_type.startswith("video/"):
-            if message.document.file_name:
-                return Path(message.document.file_name).suffix or ".mp4"
-            return ".mp4"
         if message.document.file_name:
             return Path(message.document.file_name).suffix or ""
+        mime = _document_mime(message)
+        if mime and mime.startswith("video/"):
+            return ".mp4"
+        if mime and (mime in _AUDIO_MIMES or mime.startswith("audio/")):
+            return ".mp3"
+        if mime and mime in _IMAGE_MIMES:
+            if mime == "image/png":
+                return ".png"
+            if mime == "image/gif":
+                return ".gif"
+            if mime == "image/webp":
+                return ".webp"
+            return ".jpg"
     if message.sticker:
         return ".webp"
     return ""

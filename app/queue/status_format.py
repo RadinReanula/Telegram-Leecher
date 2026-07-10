@@ -17,6 +17,7 @@ def _progress_bar(progress: int, width: int = 10) -> str:
 def format_job_status(job: DownloadJob, *, compact: bool = False) -> str:
     name = job.display_name or "Pending…"
     batch = f" ({job.batch_label})" if job.batch_label else ""
+    god = " [god]" if job.is_god else ""
 
     if compact:
         icon = {
@@ -27,16 +28,34 @@ def format_job_status(job: DownloadJob, *, compact: bool = False) -> str:
             JobStatus.SKIPPED: "⏭️",
             JobStatus.CANCELLED: "🛑",
         }[job.status]
-        detail = job.result or job.error or job.stage.value
+        if job.is_god and job.status == JobStatus.RUNNING:
+            detail = (
+                f"@{job.god_current_id or '?'} "
+                f"sent {job.god_downloaded} miss {job.god_missing}"
+            )
+        else:
+            detail = job.result or job.error or job.stage.value
         if len(detail) > 40:
             detail = detail[:37] + "..."
-        return f"{icon} `{job.id}`{batch} {name} — {detail}"
+        return f"{icon} `{job.id}`{batch}{god} {name} — {detail}"
 
     lines = [
-        f"Job `{job.id}`{batch}",
+        f"Job `{job.id}`{batch}{god}",
         f"Name: {name}",
         f"Status: {job.status.value} | Stage: {job.stage.value}",
     ]
+
+    if job.is_god:
+        direction = job.god_direction or "?"
+        lines.append(f"God: {direction} from {job.god_start_id}")
+        lines.append(
+            f"Crawl: scanned {job.god_scanned}, sent {job.god_downloaded}, "
+            f"skipped {job.god_skipped}, missing {job.god_missing}"
+        )
+        if job.god_current_id is not None:
+            lines.append(
+                f"At msg {job.god_current_id} (miss streak {job.god_miss_streak})"
+            )
 
     if job.status == JobStatus.RUNNING and job.stage == JobStage.DOWNLOADING:
         lines.append(f"Progress: {_progress_bar(job.progress)}")

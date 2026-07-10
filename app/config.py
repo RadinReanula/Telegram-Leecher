@@ -64,11 +64,22 @@ class Settings(BaseSettings):
         validation_alias="DOWNLOAD_PROGRESS_ENABLED",
     )
 
+    # God mode — sequential message-ID crawl
+    god_delay_sec: float = Field(default=2.0, validation_alias="GOD_DELAY_SEC")
+    god_floodwait_extra_sec: int = Field(default=5, validation_alias="GOD_FLOODWAIT_EXTRA_SEC")
+    god_max_consecutive_miss: int = Field(default=25, validation_alias="GOD_MAX_CONSECUTIVE_MISS")
+    god_max_messages: int = Field(default=5000, validation_alias="GOD_MAX_MESSAGES")
+    god_skip_already_seen_groups: bool = Field(
+        default=True,
+        validation_alias="GOD_SKIP_ALREADY_SEEN_GROUPS",
+    )
+
     @field_validator(
         "sync_dialogs_on_startup",
         "sync_dialogs_in_background",
         "album_pipeline",
         "download_progress_enabled",
+        "god_skip_already_seen_groups",
         mode="before",
     )
     @classmethod
@@ -81,7 +92,14 @@ class Settings(BaseSettings):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
 
-    @field_validator("queue_workers", "album_concurrency", "floodwait_max_retries")
+    @field_validator(
+        "queue_workers",
+        "album_concurrency",
+        "floodwait_max_retries",
+        "god_floodwait_extra_sec",
+        "god_max_consecutive_miss",
+        "god_max_messages",
+    )
     @classmethod
     def validate_positive_int(cls, value: int) -> int:
         if value < 0:
@@ -100,6 +118,20 @@ class Settings(BaseSettings):
     def validate_album_concurrency(cls, value: int) -> int:
         if value < 1:
             raise ValueError("ALBUM_CONCURRENCY must be at least 1.")
+        return value
+
+    @field_validator("god_max_messages", "god_max_consecutive_miss")
+    @classmethod
+    def validate_god_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("God mode limits must be at least 1.")
+        return value
+
+    @field_validator("god_delay_sec")
+    @classmethod
+    def validate_god_delay(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("GOD_DELAY_SEC must be non-negative.")
         return value
 
     @cached_property

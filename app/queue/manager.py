@@ -8,7 +8,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from pyrogram.errors import FloodWait
 
 from app.config import Settings
-from app.downloader.results import DownloadOutcome
+from app.downloader.results import DownloadOutcome, DownloadResult
 from app.downloader.service import DownloadService
 from app.queue.exceptions import JobCancelledError
 from app.queue.models import DownloadJob, JobStage, JobStatus
@@ -176,7 +176,15 @@ class JobQueue:
                 self._queue.task_done()
 
     def _expand_media_group_for_job(self, job: DownloadJob) -> bool:
-        return job.batch_total is None or job.batch_total <= 1
+        # Always expand albums (including batch). Duplicate albums are skipped via
+        # DownloadService media-group claim dedupe.
+        return True
+
+    def user_has_active_god_job(self, user_id: int) -> bool:
+        return any(
+            job.is_god and not job.is_finished
+            for job in self.jobs_for_user(user_id, include_finished=False)
+        )
 
     async def _run_job(self, job_id: str) -> None:
         job = self._jobs.get(job_id)
@@ -228,6 +236,29 @@ class JobQueue:
                 job.stage = JobStage.UPLOADING
             self._schedule_status_refresh(job)
 
+        def on_god_progress(
+            stage: str,
+            progress: int,
+            display_name: str | None,
+            counters: dict[str, int],
+        ) -> None:
+            if display_name:
+                job.display_name = display_name
+            job.progress = progress
+            job.god_scanned = counters.get("scanned", job.god_scanned)
+            job.god_downloaded = counters.get("downloaded", job.god_downloaded)
+            job.god_skipped = counters.get("skipped", job.god_skipped)
+            job.god_missing = counters.get("missing", job.god_missing)
+            job.god_current_id = counters.get("current_id", job.god_current_id)
+            job.god_miss_streak = counters.get("miss_streak", job.god_miss_streak)
+            if stage == "resolving":
+                job.stage = JobStage.RESOLVING
+            elif stage == "downloading":
+                job.stage = JobStage.DOWNLOADING
+            elif stage == "uploading":
+                job.stage = JobStage.UPLOADING
+            self._schedule_status_refresh(job)
+
         def is_cancelled() -> bool:
             return job_id in self._cancelled_ids or job.is_finished
 
@@ -235,17 +266,36 @@ class JobQueue:
         try:
             while True:
                 try:
-                    result = await self._download_service.process_link(
-                        requester_id=job.requester_id,
-                        bot_chat_id=job.bot_chat_id,
-                        link=job.link,
-                        on_progress=on_progress,
-                        expand_media_group=self._expand_media_group_for_job(job),
-                        parsed=job.parsed,
-                        is_cancelled=is_cancelled,
-                    )
+                    if job.is_god:
+                        if job.god_direction is None or job.god_start_id is None:
+                            result = DownloadResult(
+                                DownloadOutcome.FAILED,
+                                "God job missing direction or start message id.",
+                            )
+                        else:
+                            result = await self._download_service.process_god_crawl(
+                                requester_id=job.requester_id,
+                                bot_chat_id=job.bot_chat_id,
+                                link=job.link,
+                                direction=job.god_direction,
+                                start_id=job.god_start_id,
+                                parsed=job.parsed,
+                                on_progress=on_god_progress,
+                                is_cancelled=is_cancelled,
+                            )
+                    else:
+                        result = await self._download_service.process_link(
+                            requester_id=job.requester_id,
+                            bot_chat_id=job.bot_chat_id,
+                            link=job.link,
+                            on_progress=on_progress,
+                            expand_media_group=self._expand_media_group_for_job(job),
+                            parsed=job.parsed,
+                            is_cancelled=is_cancelled,
+                        )
                     break
                 except FloodWait as exc:
+                    # God mode handles FloodWait internally; this path is for link jobs.
                     if flood_retries >= self._settings.floodwait_max_retries:
                         job.finished_at = time.time()
                         job.status = JobStatus.FAILED

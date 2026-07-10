@@ -2,6 +2,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Literal
 
 from app.parser.telegram_links import ParsedLink
 
@@ -46,6 +47,15 @@ class DownloadJob:
     error: str | None = None
     batch_index: int | None = None
     batch_total: int | None = None
+    mode: Literal["link", "god"] = "link"
+    god_direction: Literal["up", "down"] | None = None
+    god_start_id: int | None = None
+    god_scanned: int = 0
+    god_downloaded: int = 0
+    god_skipped: int = 0
+    god_missing: int = 0
+    god_current_id: int | None = None
+    god_miss_streak: int = 0
 
     @property
     def is_finished(self) -> bool:
@@ -61,3 +71,7 @@ class DownloadJob:
         if self.batch_index is not None and self.batch_total is not None:
             return f"{self.batch_index}/{self.batch_total}"
         return None
+
+    @property
+    def is_god(self) -> bool:
+        return self.mode == "god"
