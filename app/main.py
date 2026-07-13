@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher
+from aiogram.types import BotCommand
 from pyrogram import Client
 
 from app.bot.handlers import create_router
@@ -65,6 +66,26 @@ async def run() -> None:
     download_service = DownloadService(user_client, bot, settings)
     job_queue = JobQueue(download_service, bot, settings)
     dispatcher.include_router(create_router(settings, download_service, job_queue))
+
+    @dispatcher.startup()
+    async def register_bot_commands() -> None:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Start and show commands"),
+                BotCommand(command="help", description="How to use the bot"),
+                BotCommand(command="status", description="Your job summary"),
+                BotCommand(command="stop", description="Cancel your queued/running jobs"),
+                BotCommand(command="god", description="God crawl: up|down|pause|continue"),
+                BotCommand(command="job", description="Full details for one job"),
+                BotCommand(command="queue", description="Global queue summary"),
+                BotCommand(command="auth", description="User session status"),
+            ]
+        )
+        logger.info(
+            "God mode active (GOD_DELAY_SEC=%s, GOD_MAX_MESSAGES=%s)",
+            settings.god_delay_sec,
+            settings.god_max_messages,
+        )
 
     async with user_client:
         me = await user_client.get_me()

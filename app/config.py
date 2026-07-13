@@ -23,9 +23,9 @@ class Settings(BaseSettings):
     sessions_dir: Path = Field(default=PROJECT_ROOT / "sessions", validation_alias="SESSIONS_DIR")
     tmp_dir: Path = Field(default=PROJECT_ROOT / "tmp", validation_alias="TMP_DIR")
     bot_max_file_bytes: int = Field(default=52_428_800, validation_alias="BOT_MAX_FILE_BYTES")
-    # Below the 50 MB bot cap: large files often timeout via Bot API — send via user session instead.
+    # Below the 50 MB bot cap: files above ~40 MB often timeout via Bot API — send via user session instead.
     bot_upload_threshold_bytes: int = Field(
-        default=20_971_520,
+        default=41_943_040,
         validation_alias="BOT_UPLOAD_THRESHOLD_BYTES",
     )
     bot_request_timeout_sec: int = Field(default=600, validation_alias="BOT_REQUEST_TIMEOUT_SEC")
@@ -73,6 +73,11 @@ class Settings(BaseSettings):
         default=True,
         validation_alias="GOD_SKIP_ALREADY_SEEN_GROUPS",
     )
+    # Auto-cooldown after N successful media sends (0 = disable)
+    god_cooldown_every: int = Field(default=150, validation_alias="GOD_COOLDOWN_EVERY")
+    god_cooldown_sec: int = Field(default=180, validation_alias="GOD_COOLDOWN_SEC")
+    # Max reconnect attempts before failing a god crawl
+    god_reconnect_max_retries: int = Field(default=5, validation_alias="GOD_RECONNECT_MAX_RETRIES")
 
     @field_validator(
         "sync_dialogs_on_startup",
@@ -99,6 +104,9 @@ class Settings(BaseSettings):
         "god_floodwait_extra_sec",
         "god_max_consecutive_miss",
         "god_max_messages",
+        "god_cooldown_every",
+        "god_cooldown_sec",
+        "god_reconnect_max_retries",
     )
     @classmethod
     def validate_positive_int(cls, value: int) -> int:
@@ -132,6 +140,13 @@ class Settings(BaseSettings):
     def validate_god_delay(cls, value: float) -> float:
         if value < 0:
             raise ValueError("GOD_DELAY_SEC must be non-negative.")
+        return value
+
+    @field_validator("god_reconnect_max_retries")
+    @classmethod
+    def validate_god_reconnect(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("GOD_RECONNECT_MAX_RETRIES must be at least 1.")
         return value
 
     @cached_property

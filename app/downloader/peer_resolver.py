@@ -1,9 +1,11 @@
 import json
 import logging
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 from pyrogram import Client
-from pyrogram.errors import ChannelPrivate, FloodWait, PeerIdInvalid, RPCError
+from pyrogram.errors import ChannelPrivate, FloodWait, MessageIdInvalid, PeerIdInvalid, RPCError
+from pyrogram.types import Dialog
 
 from app.parser.telegram_links import ParsedLink
 
@@ -69,10 +71,29 @@ def chat_matches_internal_id(chat_id: int, internal_id: int) -> bool:
     return chat_id == chat_id_from_internal_id(internal_id)
 
 
+async def _iter_dialogs(client: Client) -> AsyncIterator[Dialog]:
+    """Yield dialogs, skipping entries Pyrogram cannot parse (e.g. reply into private channel)."""
+    iterator = client.get_dialogs().__aiter__()
+    while True:
+        try:
+            dialog = await iterator.__anext__()
+        except StopAsyncIteration:
+            return
+        except FloodWait:
+            raise
+        except (ChannelPrivate, PeerIdInvalid, MessageIdInvalid) as exc:
+            logger.warning("Skipping dialog during peer sync: %s", exc)
+            continue
+        except RPCError as exc:
+            logger.warning("Skipping dialog during peer sync (RPC): %s", exc)
+            continue
+        yield dialog
+
+
 async def sync_dialog_peers(client: Client) -> int:
     """Populate Pyrogram peer cache and local private-chat map from dialogs."""
     count = 0
-    async for dialog in client.get_dialogs():
+    async for dialog in _iter_dialogs(client):
         count += 1
         chat = dialog.chat
         if chat is None:
@@ -90,7 +111,7 @@ async def find_chat_in_dialogs(client: Client, internal_id: int) -> int | None:
         return cached
 
     target = chat_id_from_internal_id(internal_id)
-    async for dialog in client.get_dialogs():
+    async for dialog in _iter_dialogs(client):
         chat = dialog.chat
         if chat is None:
             continue

@@ -29,10 +29,18 @@ def format_job_status(job: DownloadJob, *, compact: bool = False) -> str:
             JobStatus.CANCELLED: "🛑",
         }[job.status]
         if job.is_god and job.status == JobStatus.RUNNING:
-            detail = (
-                f"@{job.god_current_id or '?'} "
-                f"sent {job.god_downloaded} miss {job.god_missing}"
-            )
+            if job.stage == JobStage.PAUSED:
+                detail = "paused — /god continue"
+            elif job.stage == JobStage.COOLDOWN:
+                detail = (
+                    f"cooldown {job.god_cooldown_remaining_sec}s "
+                    f"(sent {job.god_downloaded})"
+                )
+            else:
+                detail = (
+                    f"@{job.god_current_id or '?'} "
+                    f"sent {job.god_downloaded} miss {job.god_missing}"
+                )
         else:
             detail = job.result or job.error or job.stage.value
         if len(detail) > 40:
@@ -48,6 +56,13 @@ def format_job_status(job: DownloadJob, *, compact: bool = False) -> str:
     if job.is_god:
         direction = job.god_direction or "?"
         lines.append(f"God: {direction} from {job.god_start_id}")
+        every = job.god_cooldown_every
+        cool = job.god_cooldown_sec
+        if every is not None or cool is not None:
+            lines.append(
+                f"Cooldown-cooldown: every {every if every is not None else 'default'} "
+                f"sends / {cool if cool is not None else 'default'}s"
+            )
         lines.append(
             f"Crawl: scanned {job.god_scanned}, sent {job.god_downloaded}, "
             f"skipped {job.god_skipped}, missing {job.god_missing}"
@@ -55,6 +70,13 @@ def format_job_status(job: DownloadJob, *, compact: bool = False) -> str:
         if job.god_current_id is not None:
             lines.append(
                 f"At msg {job.god_current_id} (miss streak {job.god_miss_streak})"
+            )
+        if job.stage == JobStage.PAUSED:
+            lines.append("Paused — send /god continue to resume")
+        elif job.stage == JobStage.COOLDOWN:
+            lines.append(
+                f"Cooling down {job.god_cooldown_remaining_sec}s… "
+                f"(sent {job.god_success_since_cooldown} since last pause)"
             )
 
     if job.status == JobStatus.RUNNING and job.stage == JobStage.DOWNLOADING:

@@ -12,7 +12,8 @@ Personal Telegram bot that downloads media from message links using a **Bot API 
 - **Public** channels (`t.me/channel/123`) and **private** supergroups (`t.me/c/.../123`)
 - **Albums** expand fully for single-link and batch jobs (duplicate album links in one batch are skipped)
 - **Typed media delivery** for common formats (video/audio/image documents) on bot and user-session paths ΓÇö no ffmpeg
-- **Large files** delivered via user session (DM) when over bot upload limits (~20ΓÇô50 MB)
+- **Large files** delivered via user session (DM) when over bot upload limits (~40–50 MB)
+- **Sender attribution** on normal downloads (`From: @username` in caption; not used in god mode)
 - **Video metadata** and thumbnails on upload (duration, preview tile)
 - **Byte-level progress** in status messages during download (configurable)
 
@@ -23,7 +24,7 @@ Personal Telegram bot that downloads media from message links using a **Bot API 
 - **`/job <id>`** ΓÇö full detail for one job
 - **`/queue`** ΓÇö global waiting / running counts
 - **`/stop`** ΓÇö cancel **all your** queued and running jobs (including god mode) without restarting the bot
-- **`/god up|down`** ΓÇö crawl a chat by message ID and download media sequentially
+- **`/god up|down|pause|continue`** ΓÇö crawl a chat by message ID; soft-pause/resume long crawls
 - **FloodWait auto-retry** (configurable; god mode backs off and continues)
 - **Skipped** jobs for links with no media (not treated as failures)
 
@@ -179,7 +180,7 @@ For a Linux server that survives reboot and SSH disconnect, follow **[DEPLOY.md]
 | `/auth` | User session status (Pyrogram login) |
 | `/status` | Your jobs summary (newest first) |
 | `/stop` | Cancel **all your** queued and running jobs (including god); bot keeps running |
-| `/god up\|down [link]` | Crawl chat media by message ID (see below) |
+| `/god up\|down [every] [cooldown_sec] [link]` | Crawl chat media by message ID (see below) |
 | `/job <id>` | Full details for one job |
 | `/queue` | Global queue summary (waiting / running / workers) |
 | Paste link(s) | Enqueue download(s); one status message per link |
@@ -212,17 +213,23 @@ Crawl many messages in one chat without pasting every link. Message IDs generall
 
 | Command | Behavior |
 |---------|----------|
+| `/god up\|down [every] [cooldown_sec] [link]` | Crawl with optional auto-cooldown overrides |
 | `/god up <link>` | Start at that message ID and walk **toward newer** IDs |
 | `/god down <link>` | Start at that message ID and walk **toward older** IDs (down to `1`) |
 | `/god up` or `/god down` | Set direction; paste **one** link in the next message (5 min TTL) |
+| `/god pause` | Soft-pause the active god crawl (use `/god continue` to resume) |
+| `/god continue` | Resume a paused god crawl from the same message ID |
 | `/god` | Show usage |
+
+Examples: `/god down 150 180 https://t.me/c/…/123` auto-cooldowns every 150 successful sends for 180 seconds.
 
 - One composite job (not hundreds of queue entries); `/status` and `/job` show crawl counters
 - Skips text-only messages; treats deleted/missing IDs as misses (does not fail the whole run)
 - Expands albums once; later IDs in the same album are skipped
 - `/god up` stops after `GOD_MAX_CONSECUTIVE_MISS` consecutive misses (end of chat)
-- Delays between IDs (`GOD_DELAY_SEC`) and handles FloodWait inside the crawl
-- `/stop` cancels the crawl ASAP
+- Delays between IDs (`GOD_DELAY_SEC`), auto-cooldown (`GOD_COOLDOWN_*`), and handles FloodWait inside the crawl
+- Reconnects the user session on connection errors during long crawls
+- `/stop` cancels the crawl ASAP (including while paused)
 - Keep `QUEUE_WORKERS=1` while using god mode
 
 ### Batch downloads
@@ -255,7 +262,7 @@ Copy [.env.example](.env.example) to `.env`.
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `BOT_MAX_FILE_BYTES` | `52428800` | Hard cap for bot upload (~50 MB) |
-| `BOT_UPLOAD_THRESHOLD_BYTES` | `20971520` | Above ~20 MB ΓåÆ user session (fewer timeouts) |
+| `BOT_UPLOAD_THRESHOLD_BYTES` | `41943040` | Above ~40 MB ΓåÆ user session (fewer timeouts) |
 | `BOT_REQUEST_TIMEOUT_SEC` | `600` | Bot API upload timeout (seconds) |
 | `BOT_SSL_VERIFY` | `true` | Set `false` only if HTTPS inspection breaks the bot API |
 
@@ -291,6 +298,9 @@ Copy [.env.example](.env.example) to `.env`.
 | `GOD_MAX_CONSECUTIVE_MISS` | `25` | Stop `/god up` after this many consecutive missing IDs |
 | `GOD_MAX_MESSAGES` | `5000` | Hard safety cap per god run |
 | `GOD_SKIP_ALREADY_SEEN_GROUPS` | `true` | Skip album members already expanded in the crawl |
+| `GOD_COOLDOWN_EVERY` | `150` | Auto-cooldown after N successful sends (`0` = disable) |
+| `GOD_COOLDOWN_SEC` | `180` | Auto-cooldown length in seconds |
+| `GOD_RECONNECT_MAX_RETRIES` | `5` | Max reconnect attempts after connection loss in god crawl |
 
 **Tips:** Set `ALBUM_PIPELINE=true` for faster multi-photo albums. After first run, private peers stay in `sessions/peer_cache.json`. Try `QUEUE_WORKERS=2` only if you accept more FloodWait risk. Prefer `QUEUE_WORKERS=1` during god mode crawls.
 
@@ -335,13 +345,13 @@ Telegram-Leecher/
 | No user session | Run `python login.py` |
 | Cannot access chat | Join the chat with the login account |
 | FloodWait | Wait; increase `FLOODWAIT_MAX_RETRIES` |
-| File in DM from user session | Normal for large files (> ~20 MB or bot limit) |
+| File in DM from user session | Normal for large files (> ~40 MB or bot limit) |
 | `CERTIFICATE_VERIFY_FAILED` (bot) | Fix system CA / AV HTTPS scanning; last resort `BOT_SSL_VERIFY=false` |
 | Private `t.me/c/...` fails | Open chat in Telegram, restart bot, wait for `Synced N dialog(s)` |
 | Batch only shows ΓÇ£Queued NΓÇ¥ | Update to latest code (batch status message fix) |
 | Batch album only one file | Update to latest ΓÇö albums now expand in batch; duplicates skip |
 | `/stop` but one file still arrives | Current download may finish before cancel; queued jobs stop immediately |
-| God mode FloodWait / slow | Increase `GOD_DELAY_SEC`; keep `QUEUE_WORKERS=1` |
+| God mode FloodWait / slow | Increase `GOD_DELAY_SEC`; tune `GOD_COOLDOWN_*`; keep `QUEUE_WORKERS=1` |
 | God mode never stops on `/god up` | Raise or lower `GOD_MAX_CONSECUTIVE_MISS`; check chat access |
 | `TelegramConflictError` on VPS | Stop other instances (PC or second terminal); one bot token = one poller |
 | Bot slow to respond after start | Normal if dialog sync runs in background; private links work after sync |

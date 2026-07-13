@@ -2,10 +2,11 @@ import asyncio
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Literal
 
 from aiogram import F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import Message
 
 from app.config import Settings
@@ -18,16 +19,33 @@ from app.queue.status_format import format_job_status, format_status_list
 logger = logging.getLogger(__name__)
 
 _LINK_HINT = re.compile(r"t(?:elegram)?\.me/", re.IGNORECASE)
+_GOD_CMD_PREFIX = re.compile(r"^/god(?:@\w+)?(?:\s|$)", re.IGNORECASE)
+_GOD_CMD_ARGS = re.compile(r"^/god(?:@\w+)?\s*(.*)$", re.IGNORECASE | re.DOTALL)
 _GOD_PENDING_TTL_SEC = 300.0
 _GOD_USAGE = (
     "God mode — crawl message IDs in a chat and download media.\n\n"
     "Usage:\n"
-    "• /god up <link> — walk toward newer messages\n"
-    "• /god down <link> — walk toward older messages (down to 1)\n"
-    "• /god up  or  /god down — then paste one link in the next message\n\n"
-    "Direction is required. Use /stop to cancel a running god crawl.\n"
+    "• /god up|down [every] [cooldown_sec] [link]\n"
+    "• /god up|down [every] [cooldown_sec] — then paste one link\n"
+    "• /god pause — soft-pause the active god crawl\n"
+    "• /god continue — resume a paused god crawl\n\n"
+    "Examples:\n"
+    "• /god down https://t.me/c/123/456\n"
+    "• /god down 150 180 https://t.me/c/123/456\n"
+    "• /god down 100 60  (then paste a link)\n\n"
+    "every = successful sends before auto-cooldown (default from .env).\n"
+    "cooldown_sec = auto-cooldown length in seconds.\n"
+    "Use /stop to cancel a running god crawl.\n"
     "Keep QUEUE_WORKERS=1 while using god mode to reduce FloodWait risk."
 )
+
+
+@dataclass(slots=True)
+class _GodPending:
+    direction: Literal["up", "down"]
+    expires_at: float
+    cooldown_every: int | None = None
+    cooldown_sec: int | None = None
 
 
 def create_router(
@@ -37,8 +55,7 @@ def create_router(
 ) -> Router:
     router = Router()
     allowed_ids = settings.allowed_user_id_set
-    # user_id -> (direction, expires_at)
-    god_pending: dict[int, tuple[Literal["up", "down"], float]] = {}
+    god_pending: dict[int, _GodPending] = {}
 
     def is_allowed(user_id: int) -> bool:
         if not allowed_ids:
@@ -48,18 +65,46 @@ def create_router(
     def clear_god_pending(user_id: int) -> None:
         god_pending.pop(user_id, None)
 
-    def get_god_pending(user_id: int) -> Literal["up", "down"] | None:
+    def get_god_pending(user_id: int) -> _GodPending | None:
         entry = god_pending.get(user_id)
         if not entry:
             return None
-        direction, expires_at = entry
-        if time.time() > expires_at:
+        if time.time() > entry.expires_at:
             clear_god_pending(user_id)
             return None
-        return direction
+        return entry
 
-    def set_god_pending(user_id: int, direction: Literal["up", "down"]) -> None:
-        god_pending[user_id] = (direction, time.time() + _GOD_PENDING_TTL_SEC)
+    def set_god_pending(
+        user_id: int,
+        direction: Literal["up", "down"],
+        *,
+        cooldown_every: int | None = None,
+        cooldown_sec: int | None = None,
+    ) -> None:
+        god_pending[user_id] = _GodPending(
+            direction=direction,
+            expires_at=time.time() + _GOD_PENDING_TTL_SEC,
+            cooldown_every=cooldown_every,
+            cooldown_sec=cooldown_sec,
+        )
+
+    def _cooldown_summary(
+        cooldown_every: int | None,
+        cooldown_sec: int | None,
+    ) -> str:
+        every = (
+            cooldown_every
+            if cooldown_every is not None
+            else settings.god_cooldown_every
+        )
+        cool = (
+            cooldown_sec
+            if cooldown_sec is not None
+            else settings.god_cooldown_sec
+        )
+        if every <= 0 or cool <= 0:
+            return "auto-cooldown disabled"
+        return f"auto-cooldown every {every} sends for {cool}s"
 
     @router.message(CommandStart())
     async def cmd_start(message: Message) -> None:
@@ -76,7 +121,7 @@ def create_router(
             "Commands:\n"
             "/status — your jobs summary\n"
             "/stop — cancel your queued and running downloads\n"
-            "/god up|down [link] — crawl chat media by message ID\n"
+            "/god up|down|pause|continue — crawl chat media by message ID\n"
             "/job <id> — full details for one job\n"
             "/queue — global queue summary\n"
             "/auth — check user session status\n"
@@ -93,7 +138,8 @@ def create_router(
             "Each link gets its own status message with progress and timestamps. "
             "Albums expand fully (duplicate album links in one batch are skipped). "
             f"Maximum {settings.max_links_per_message} links per message. "
-            "Use /god up|down [link] to crawl many messages in a chat. "
+            "Use /god up|down [every] [cooldown_sec] [link] to crawl many messages. "
+            "Use /god pause and /god continue to soft-pause/resume. "
             "Use /job <id> for full job details. "
             "Use /stop to cancel all your active downloads (including god mode)."
         )
@@ -173,48 +219,117 @@ def create_router(
             f"{total} jobs tracked in memory."
         )
 
-    @router.message(Command("god"))
-    async def cmd_god(message: Message) -> None:
+    def _parse_god_start_args(
+        rest: str,
+    ) -> tuple[int | None, int | None, str] | None:
+        """Parse optional every/cooldown_sec ints then remainder text.
+
+        Returns (every, cooldown_sec, remainder) or None on invalid ints.
+        """
+        tokens = rest.split()
+        every: int | None = None
+        cool: int | None = None
+        idx = 0
+        while idx < len(tokens) and idx < 2 and tokens[idx].isdigit():
+            value = int(tokens[idx])
+            if idx == 0:
+                every = value
+            else:
+                cool = value
+            idx += 1
+        # Reject negative-looking tokens that aren't pure digits (already handled).
+        # If a non-link token remains that looks numeric-invalid, fail later via link parse.
+        remainder = " ".join(tokens[idx:]).strip()
+        return every, cool, remainder
+
+    async def _handle_god_command(message: Message, args_text: str) -> None:
+        if not message.from_user:
+            return
         if not is_allowed(message.from_user.id):
             await message.answer("You are not authorized to use this bot.")
             return
 
         user_id = message.from_user.id
-        if job_queue.user_has_active_god_job(user_id):
-            await message.answer("God mode already running — use /stop to cancel it first.")
-            return
+        args_text = args_text.strip()
+        logger.info("God command from user %s args=%r", user_id, args_text)
 
-        parts = (message.text or "").split(maxsplit=2)
-        # /god
-        if len(parts) == 1:
+        if not args_text:
             await message.answer(_GOD_USAGE)
             return
 
-        direction_raw = parts[1].strip().lower()
-        if direction_raw not in {"up", "down"}:
+        tokens = args_text.split(maxsplit=1)
+        verb = tokens[0].lower()
+
+        if verb in {"pause", "continue"}:
+            if len(tokens) > 1 and tokens[1].strip():
+                await message.answer(
+                    f"/god {verb} takes no extra arguments.\n\n" + _GOD_USAGE
+                )
+                return
+            if verb == "pause":
+                result = job_queue.pause_god_job(user_id)
+                if result == "none":
+                    await message.answer("No active god crawl to pause.")
+                elif result == "already_paused":
+                    await message.answer(
+                        "God crawl is already paused. "
+                        "/god continue to resume, /stop to cancel."
+                    )
+                else:
+                    await message.answer(
+                        "God crawl paused. /god continue to resume, /stop to cancel."
+                    )
+                return
+
+            result = job_queue.continue_god_job(user_id)
+            if result == "none":
+                await message.answer("No paused god crawl to continue.")
+            elif result == "already_running":
+                await message.answer("God crawl is already running.")
+            else:
+                await message.answer("God crawl continuing…")
+            return
+
+        if verb not in {"up", "down"}:
             await message.answer(
-                "Direction required: up or down.\n\n" + _GOD_USAGE
+                "Use /god up|down|pause|continue.\n\n" + _GOD_USAGE
             )
             return
 
-        direction: Literal["up", "down"] = "up" if direction_raw == "up" else "down"
-
-        # /god up  or  /god down  — wait for next link
-        if len(parts) == 2:
-            set_god_pending(user_id, direction)
+        if job_queue.user_has_active_god_job(user_id):
             await message.answer(
-                f"God mode ready ({direction}). "
+                "God mode already running — use /god pause, /god continue, "
+                "or /stop to cancel it first."
+            )
+            return
+
+        direction: Literal["up", "down"] = "up" if verb == "up" else "down"
+        rest = tokens[1].strip() if len(tokens) > 1 else ""
+        parsed_args = _parse_god_start_args(rest)
+        if parsed_args is None:
+            await message.answer("Invalid cooldown numbers.\n\n" + _GOD_USAGE)
+            return
+        cooldown_every, cooldown_sec, remainder = parsed_args
+
+        if not remainder:
+            set_god_pending(
+                user_id,
+                direction,
+                cooldown_every=cooldown_every,
+                cooldown_sec=cooldown_sec,
+            )
+            await message.answer(
+                f"God mode ready ({direction}, {_cooldown_summary(cooldown_every, cooldown_sec)}). "
                 "Paste exactly one t.me message link in your next message "
                 f"(expires in {int(_GOD_PENDING_TTL_SEC // 60)} minutes)."
             )
             return
 
-        # /god up <link>  or  /god down <link>
-        link_text = parts[2].strip()
-        extraction = extract_telegram_links(link_text)
+        extraction = extract_telegram_links(remainder)
         if len(extraction.links) != 1:
             await message.answer(
-                "Provide exactly one valid t.me message link after the direction.\n\n"
+                "Provide exactly one valid t.me message link after the direction "
+                "(and optional every/cooldown_sec).\n\n"
                 + _GOD_USAGE
             )
             return
@@ -226,7 +341,13 @@ def create_router(
             extraction.links[0],
             direction=direction,
             parsed=parsed,
+            cooldown_every=cooldown_every,
+            cooldown_sec=cooldown_sec,
         )
+
+    @router.message(Command("god", ignore_case=True))
+    async def cmd_god(message: Message, command: CommandObject) -> None:
+        await _handle_god_command(message, command.args or "")
 
     def _queued_status_text(
         job: DownloadJob, position: int, running: int, batch_part: str = ""
@@ -241,13 +362,16 @@ def create_router(
         *,
         direction: Literal["up", "down"],
         parsed: ParsedLink | None,
+        cooldown_every: int | None = None,
+        cooldown_sec: int | None = None,
     ) -> None:
         if parsed is None:
             await message.answer("Could not parse that link.")
             return
 
         status_message = await message.answer(
-            f"Queuing god {direction} from msg {parsed.message_id}…"
+            f"Queuing god {direction} from msg {parsed.message_id} "
+            f"({_cooldown_summary(cooldown_every, cooldown_sec)})…"
         )
         job = DownloadJob(
             link=link,
@@ -259,14 +383,23 @@ def create_router(
             mode="god",
             god_direction=direction,
             god_start_id=parsed.message_id,
+            god_cooldown_every=cooldown_every,
+            god_cooldown_sec=cooldown_sec,
             display_name=f"God {direction} · msg {parsed.message_id}",
         )
 
         try:
             _, position, running = await job_queue.enqueue(job)
             await status_message.edit_text(_queued_status_text(job, position, running))
+            logger.info(
+                "God job %s queued at position %s for user %s",
+                job.id,
+                position,
+                job.requester_id,
+            )
         except ValueError as exc:
             await status_message.edit_text(str(exc))
+            logger.warning("God enqueue failed for user %s: %s", job.requester_id, exc)
 
     async def _enqueue_single_link(
         message: Message,
@@ -350,13 +483,24 @@ def create_router(
             return
 
         user_id = message.from_user.id
-        pending_direction = get_god_pending(user_id)
+        text = message.text
+
+        # Fallback when Telegram does not tag /god as a bot_command entity
+        if text and _GOD_CMD_PREFIX.match(text):
+            match = _GOD_CMD_ARGS.match(text)
+            args_text = match.group(1).strip() if match else ""
+            await _handle_god_command(message, args_text)
+            return
+
+        pending = get_god_pending(user_id)
 
         # Two-step god mode: direction already set, waiting for a link
-        if pending_direction is not None:
+        if pending is not None:
             if not _LINK_HINT.search(message.text):
                 await message.answer(
-                    f"God mode ({pending_direction}) is waiting for a link. "
+                    f"God mode ({pending.direction}, "
+                    f"{_cooldown_summary(pending.cooldown_every, pending.cooldown_sec)}) "
+                    "is waiting for a link. "
                     "Paste one t.me message link, or /stop to cancel."
                 )
                 return
@@ -372,7 +516,10 @@ def create_router(
 
             if job_queue.user_has_active_god_job(user_id):
                 clear_god_pending(user_id)
-                await message.answer("God mode already running — use /stop to cancel it first.")
+                await message.answer(
+                    "God mode already running — use /god pause, /god continue, "
+                    "or /stop to cancel it first."
+                )
                 return
 
             clear_god_pending(user_id)
@@ -380,8 +527,10 @@ def create_router(
             await _enqueue_god_job(
                 message,
                 extraction.links[0],
-                direction=pending_direction,
+                direction=pending.direction,
                 parsed=parsed,
+                cooldown_every=pending.cooldown_every,
+                cooldown_sec=pending.cooldown_sec,
             )
             return
 

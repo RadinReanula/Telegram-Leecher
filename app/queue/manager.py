@@ -42,6 +42,7 @@ class JobQueue:
         self._jobs_by_user: defaultdict[int, list[str]] = defaultdict(list)
         self._enqueue_count = 0
         self._cancelled_ids: set[str] = set()
+        self._paused_god_ids: set[str] = set()
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def start(self) -> None:
@@ -69,7 +70,7 @@ class JobQueue:
         batch_burst: bool = False,
     ) -> tuple[DownloadJob, int, int]:
         async with self._lock:
-            if not batch_burst:
+            if not batch_burst and not job.is_god:
                 active_for_user = (
                     self._pending_by_user[job.requester_id]
                     + self._running_by_user[job.requester_id]
@@ -126,6 +127,7 @@ class JobQueue:
             for job in self.jobs_for_user(user_id, include_finished=False):
                 job_id = job.id
                 self._cancelled_ids.add(job_id)
+                self._paused_god_ids.discard(job_id)
                 is_running = job_id in self._running_ids
 
                 if is_running:
@@ -154,6 +156,7 @@ class JobQueue:
     async def _finalize_cancelled(self, job: DownloadJob) -> None:
         if job.is_finished:
             return
+        self._paused_god_ids.discard(job.id)
         job.status = JobStatus.CANCELLED
         job.stage = JobStage.CANCELLED
         job.error = _CANCEL_MESSAGE
@@ -185,6 +188,40 @@ class JobQueue:
             job.is_god and not job.is_finished
             for job in self.jobs_for_user(user_id, include_finished=False)
         )
+
+    def _active_god_job(self, user_id: int) -> DownloadJob | None:
+        for job in self.jobs_for_user(user_id, include_finished=False):
+            if job.is_god:
+                return job
+        return None
+
+    def pause_god_job(self, user_id: int) -> str:
+        """Soft-pause active god job. Returns: paused | already_paused | none."""
+        job = self._active_god_job(user_id)
+        if job is None:
+            return "none"
+        if job.id in self._paused_god_ids:
+            return "already_paused"
+        self._paused_god_ids.add(job.id)
+        job.stage = JobStage.PAUSED
+        asyncio.create_task(self._refresh_status_safe(job, force=True))
+        return "paused"
+
+    def continue_god_job(self, user_id: int) -> str:
+        """Resume soft-paused god job. Returns: continued | already_running | none."""
+        job = self._active_god_job(user_id)
+        if job is None:
+            return "none"
+        if job.id not in self._paused_god_ids:
+            return "already_running"
+        self._paused_god_ids.discard(job.id)
+        job.stage = JobStage.DOWNLOADING
+        asyncio.create_task(self._refresh_status_safe(job, force=True))
+        return "continued"
+
+    def is_god_job_paused(self, user_id: int) -> bool:
+        job = self._active_god_job(user_id)
+        return job is not None and job.id in self._paused_god_ids
 
     async def _run_job(self, job_id: str) -> None:
         job = self._jobs.get(job_id)
@@ -251,16 +288,33 @@ class JobQueue:
             job.god_missing = counters.get("missing", job.god_missing)
             job.god_current_id = counters.get("current_id", job.god_current_id)
             job.god_miss_streak = counters.get("miss_streak", job.god_miss_streak)
+            job.god_success_since_cooldown = counters.get(
+                "success_since_cooldown", job.god_success_since_cooldown
+            )
+            job.god_cooldown_remaining_sec = counters.get(
+                "cooldown_remaining_sec", job.god_cooldown_remaining_sec
+            )
             if stage == "resolving":
                 job.stage = JobStage.RESOLVING
             elif stage == "downloading":
                 job.stage = JobStage.DOWNLOADING
             elif stage == "uploading":
                 job.stage = JobStage.UPLOADING
-            self._schedule_status_refresh(job)
+            elif stage == "cooldown":
+                job.stage = JobStage.COOLDOWN
+            elif stage == "paused":
+                job.stage = JobStage.PAUSED
+            force = stage in {"paused", "cooldown"}
+            if force:
+                asyncio.create_task(self._refresh_status_safe(job, force=True))
+            else:
+                self._schedule_status_refresh(job)
 
         def is_cancelled() -> bool:
             return job_id in self._cancelled_ids or job.is_finished
+
+        def is_paused() -> bool:
+            return job_id in self._paused_god_ids
 
         flood_retries = 0
         try:
@@ -273,6 +327,16 @@ class JobQueue:
                                 "God job missing direction or start message id.",
                             )
                         else:
+                            cooldown_every = (
+                                job.god_cooldown_every
+                                if job.god_cooldown_every is not None
+                                else self._settings.god_cooldown_every
+                            )
+                            cooldown_sec = (
+                                job.god_cooldown_sec
+                                if job.god_cooldown_sec is not None
+                                else self._settings.god_cooldown_sec
+                            )
                             result = await self._download_service.process_god_crawl(
                                 requester_id=job.requester_id,
                                 bot_chat_id=job.bot_chat_id,
@@ -282,6 +346,9 @@ class JobQueue:
                                 parsed=job.parsed,
                                 on_progress=on_god_progress,
                                 is_cancelled=is_cancelled,
+                                is_paused=is_paused,
+                                cooldown_every=cooldown_every,
+                                cooldown_sec=cooldown_sec,
                             )
                     else:
                         result = await self._download_service.process_link(
@@ -337,9 +404,11 @@ class JobQueue:
             await self._refresh_status_message(job, force=True)
         except JobCancelledError:
             self._cancelled_ids.discard(job_id)
+            self._paused_god_ids.discard(job_id)
             await self._finalize_cancelled(job)
         except asyncio.CancelledError:
             self._cancelled_ids.discard(job_id)
+            self._paused_god_ids.discard(job_id)
             await self._finalize_cancelled(job)
         except Exception:
             logger.exception("Job %s failed for link %s", job.id, job.link)
@@ -349,6 +418,7 @@ class JobQueue:
             job.error = "Unexpected error while downloading."
             await self._refresh_status_message(job, force=True)
         finally:
+            self._paused_god_ids.discard(job_id)
             async with self._lock:
                 self._running_ids.discard(job_id)
                 self._running_by_user[job.requester_id] -= 1
@@ -363,9 +433,9 @@ class JobQueue:
         self._pending_refresh.add(job.id)
         asyncio.create_task(self._refresh_status_safe(job))
 
-    async def _refresh_status_safe(self, job: DownloadJob) -> None:
+    async def _refresh_status_safe(self, job: DownloadJob, *, force: bool = False) -> None:
         try:
-            await self._refresh_status_message(job)
+            await self._refresh_status_message(job, force=force)
         finally:
             self._pending_refresh.discard(job.id)
 
@@ -378,6 +448,8 @@ class JobQueue:
                 JobStage.SKIPPED,
                 JobStage.FAILED,
                 JobStage.CANCELLED,
+                JobStage.PAUSED,
+                JobStage.COOLDOWN,
             }:
                 return
 
@@ -389,6 +461,10 @@ class JobQueue:
             JobStatus.SKIPPED: "⏭️",
             JobStatus.CANCELLED: "🛑",
         }[job.status]
+        if job.status == JobStatus.RUNNING and job.stage == JobStage.PAUSED:
+            prefix = "⏸️"
+        elif job.status == JobStatus.RUNNING and job.stage == JobStage.COOLDOWN:
+            prefix = "❄️"
         body = format_job_status(job)
         text = f"{prefix} {body}"
 

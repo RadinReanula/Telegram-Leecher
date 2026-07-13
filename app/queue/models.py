@@ -21,6 +21,8 @@ class JobStage(str, Enum):
     RESOLVING = "resolving"
     DOWNLOADING = "downloading"
     UPLOADING = "uploading"
+    COOLDOWN = "cooldown"
+    PAUSED = "paused"
     DONE = "done"
     SKIPPED = "skipped"
     FAILED = "failed"
@@ -50,12 +52,16 @@ class DownloadJob:
     mode: Literal["link", "god"] = "link"
     god_direction: Literal["up", "down"] | None = None
     god_start_id: int | None = None
+    god_cooldown_every: int | None = None
+    god_cooldown_sec: int | None = None
     god_scanned: int = 0
     god_downloaded: int = 0
     god_skipped: int = 0
     god_missing: int = 0
     god_current_id: int | None = None
     god_miss_streak: int = 0
+    god_success_since_cooldown: int = 0
+    god_cooldown_remaining_sec: int = 0
 
     @property
     def is_finished(self) -> bool:
