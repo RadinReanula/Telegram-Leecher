@@ -4,7 +4,7 @@ import time
 from collections import defaultdict, deque
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from pyrogram.errors import FloodWait
 
 from app.config import Settings
@@ -44,6 +44,7 @@ class JobQueue:
         self._cancelled_ids: set[str] = set()
         self._paused_god_ids: set[str] = set()
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
+        self._god_cooldown_announced: set[str] = set()
 
     async def start(self) -> None:
         if self._workers:
@@ -304,10 +305,18 @@ class JobQueue:
                 job.stage = JobStage.COOLDOWN
             elif stage == "paused":
                 job.stage = JobStage.PAUSED
-            force = stage in {"paused", "cooldown"}
-            if force:
+            if stage == "paused":
                 asyncio.create_task(self._refresh_status_safe(job, force=True))
+            elif stage == "cooldown":
+                # Announce cooldown once; further countdown ticks use normal throttle.
+                force_cooldown = job.id not in self._god_cooldown_announced
+                if force_cooldown:
+                    self._god_cooldown_announced.add(job.id)
+                asyncio.create_task(
+                    self._refresh_status_safe(job, force=force_cooldown)
+                )
             else:
+                self._god_cooldown_announced.discard(job.id)
                 self._schedule_status_refresh(job)
 
         def is_cancelled() -> bool:
@@ -349,6 +358,7 @@ class JobQueue:
                                 is_paused=is_paused,
                                 cooldown_every=cooldown_every,
                                 cooldown_sec=cooldown_sec,
+                                end_id=job.god_end_id,
                             )
                     else:
                         result = await self._download_service.process_link(
@@ -419,6 +429,7 @@ class JobQueue:
             await self._refresh_status_message(job, force=True)
         finally:
             self._paused_god_ids.discard(job_id)
+            self._god_cooldown_announced.discard(job_id)
             async with self._lock:
                 self._running_ids.discard(job_id)
                 self._running_by_user[job.requester_id] -= 1
@@ -442,14 +453,18 @@ class JobQueue:
     async def _refresh_status_message(self, job: DownloadJob, *, force: bool = False) -> None:
         now = time.time()
         last = self._last_status_edit.get(job.id, 0)
-        if not force and (now - last) < self._settings.status_update_interval_sec:
+        interval = (
+            self._settings.god_status_update_interval_sec
+            if job.is_god
+            else self._settings.status_update_interval_sec
+        )
+        if not force and (now - last) < interval:
             if job.stage not in {
                 JobStage.DONE,
                 JobStage.SKIPPED,
                 JobStage.FAILED,
                 JobStage.CANCELLED,
                 JobStage.PAUSED,
-                JobStage.COOLDOWN,
             }:
                 return
 
@@ -468,18 +483,33 @@ class JobQueue:
         body = format_job_status(job)
         text = f"{prefix} {body}"
 
-        try:
+        async def do_edit() -> None:
             await self._bot.edit_message_text(
                 text=text,
                 chat_id=job.status_chat_id,
                 message_id=job.status_message_id,
             )
-            self._last_status_edit[job.id] = now
+
+        try:
+            if job.is_god:
+                await self._download_service.bot_api_gate.run(do_edit)
+            else:
+                await do_edit()
+            self._last_status_edit[job.id] = time.time()
         except TelegramBadRequest as exc:
             if "message is not modified" in str(exc).lower():
-                self._last_status_edit[job.id] = now
+                self._last_status_edit[job.id] = time.time()
                 return
             logger.warning("Could not edit status message for job %s: %s", job.id, exc)
+        except TelegramRetryAfter as exc:
+            wait_for = float(exc.retry_after) + 1.0
+            logger.warning(
+                "Status edit RetryAfter %ss for job %s — postponing Bot API gate",
+                exc.retry_after,
+                job.id,
+            )
+            self._download_service.bot_api_gate.postpone(wait_for)
+            self._last_status_edit[job.id] = time.time()
         except TelegramNetworkError as exc:
             logger.warning("Network error editing status for job %s: %s", job.id, exc)
 
@@ -493,6 +523,7 @@ class JobQueue:
         to_remove = len(self._jobs) - self._settings.job_history_limit
         for job in finished[:to_remove]:
             del self._jobs[job.id]
+            self._god_cooldown_announced.discard(job.id)
             user_list = self._jobs_by_user.get(job.requester_id)
             if user_list and job.id in user_list:
                 user_list.remove(job.id)

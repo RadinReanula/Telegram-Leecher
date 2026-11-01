@@ -1,0 +1,10 @@
+[Unit]
+Description=Telegram Leecher weekly dependency update
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=azureuser
+Group=azureuser
+WorkingDirectory=/home/azureuser/Projects/Telegram-Leecher-Source
+ExecStart=/home/azureuser/Projects/Telegram-Leecher-Source/scripts/weekly_deps_update.sh

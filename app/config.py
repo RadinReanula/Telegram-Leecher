@@ -78,6 +78,17 @@ class Settings(BaseSettings):
     god_cooldown_sec: int = Field(default=180, validation_alias="GOD_COOLDOWN_SEC")
     # Max reconnect attempts before failing a god crawl
     god_reconnect_max_retries: int = Field(default=5, validation_alias="GOD_RECONNECT_MAX_RETRIES")
+    # Min seconds between Bot API calls during god mode (private-chat ~1 msg/sec)
+    god_bot_min_interval_sec: float = Field(default=1.2, validation_alias="GOD_BOT_MIN_INTERVAL_SEC")
+    # Status edit throttle during god jobs (separate from STATUS_UPDATE_INTERVAL_SEC)
+    god_status_update_interval_sec: float = Field(
+        default=8.0,
+        validation_alias="GOD_STATUS_UPDATE_INTERVAL_SEC",
+    )
+    # Max TelegramRetryAfter retries per gated Bot API call in god mode
+    god_bot_retry_max: int = Field(default=2, validation_alias="GOD_BOT_RETRY_MAX")
+    # Retries of the same message id before god mode records a miss and moves on
+    god_item_max_retries: int = Field(default=3, validation_alias="GOD_ITEM_MAX_RETRIES")
 
     @field_validator(
         "sync_dialogs_on_startup",
@@ -107,6 +118,8 @@ class Settings(BaseSettings):
         "god_cooldown_every",
         "god_cooldown_sec",
         "god_reconnect_max_retries",
+        "god_bot_retry_max",
+        "god_item_max_retries",
     )
     @classmethod
     def validate_positive_int(cls, value: int) -> int:
@@ -128,18 +141,18 @@ class Settings(BaseSettings):
             raise ValueError("ALBUM_CONCURRENCY must be at least 1.")
         return value
 
-    @field_validator("god_max_messages", "god_max_consecutive_miss")
+    @field_validator("god_max_messages", "god_max_consecutive_miss", "god_item_max_retries")
     @classmethod
     def validate_god_positive(cls, value: int) -> int:
         if value < 1:
             raise ValueError("God mode limits must be at least 1.")
         return value
 
-    @field_validator("god_delay_sec")
+    @field_validator("god_delay_sec", "god_bot_min_interval_sec", "god_status_update_interval_sec")
     @classmethod
     def validate_god_delay(cls, value: float) -> float:
         if value < 0:
-            raise ValueError("GOD_DELAY_SEC must be non-negative.")
+            raise ValueError("God timing values must be non-negative.")
         return value
 
     @field_validator("god_reconnect_max_retries")

@@ -27,14 +27,17 @@ _GOD_USAGE = (
     "Usage:\n"
     "• /god up|down [every] [cooldown_sec] [link]\n"
     "• /god up|down [every] [cooldown_sec] — then paste one link\n"
+    "• /god range <start link> <end link>\n"
+    "• /god range — then paste the start link, then the end link\n"
     "• /god pause — soft-pause the active god crawl\n"
     "• /god continue — resume a paused god crawl\n\n"
     "Examples:\n"
     "• /god down https://t.me/c/123/456\n"
     "• /god down 150 180 https://t.me/c/123/456\n"
-    "• /god down 100 60  (then paste a link)\n\n"
+    "• /god range https://t.me/c/123/10 https://t.me/c/123/40\n\n"
     "every = successful sends before auto-cooldown (default from .env).\n"
     "cooldown_sec = auto-cooldown length in seconds.\n"
+    "Range downloads every media id between the two links, inclusive.\n"
     "Use /stop to cancel a running god crawl.\n"
     "Keep QUEUE_WORKERS=1 while using god mode to reduce FloodWait risk."
 )
@@ -42,10 +45,12 @@ _GOD_USAGE = (
 
 @dataclass(slots=True)
 class _GodPending:
-    direction: Literal["up", "down"]
+    direction: Literal["up", "down", "range"]
     expires_at: float
     cooldown_every: int | None = None
     cooldown_sec: int | None = None
+    range_start_link: str | None = None
+    range_start_parsed: ParsedLink | None = None
 
 
 def create_router(
@@ -76,16 +81,20 @@ def create_router(
 
     def set_god_pending(
         user_id: int,
-        direction: Literal["up", "down"],
+        direction: Literal["up", "down", "range"],
         *,
         cooldown_every: int | None = None,
         cooldown_sec: int | None = None,
+        range_start_link: str | None = None,
+        range_start_parsed: ParsedLink | None = None,
     ) -> None:
         god_pending[user_id] = _GodPending(
             direction=direction,
             expires_at=time.time() + _GOD_PENDING_TTL_SEC,
             cooldown_every=cooldown_every,
             cooldown_sec=cooldown_sec,
+            range_start_link=range_start_link,
+            range_start_parsed=range_start_parsed,
         )
 
     def _cooldown_summary(
@@ -290,9 +299,13 @@ def create_router(
                 await message.answer("God crawl continuing…")
             return
 
+        if verb == "range":
+            await _handle_god_range(message, tokens[1].strip() if len(tokens) > 1 else "")
+            return
+
         if verb not in {"up", "down"}:
             await message.answer(
-                "Use /god up|down|pause|continue.\n\n" + _GOD_USAGE
+                "Use /god up|down|range|pause|continue.\n\n" + _GOD_USAGE
             )
             return
 
@@ -356,6 +369,82 @@ def create_router(
             return f"⏳ [{job.id}]{batch_part} Queued — starting soon…"
         return f"⏳ [{job.id}]{batch_part} Queued — position #{position} in line."
 
+    def _same_chat(left: ParsedLink, right: ParsedLink) -> bool:
+        if left.username and right.username:
+            return left.username.lower() == right.username.lower()
+        if left.private_internal_id is not None and right.private_internal_id is not None:
+            return left.private_internal_id == right.private_internal_id
+        return False
+
+    async def _handle_god_range(message: Message, remainder: str) -> None:
+        if not message.from_user:
+            return
+        user_id = message.from_user.id
+        if job_queue.user_has_active_god_job(user_id):
+            await message.answer(
+                "God mode already running — use /god pause, /god continue, "
+                "or /stop to cancel it first."
+            )
+            return
+
+        extraction = extract_telegram_links(remainder) if remainder else None
+        links = extraction.links if extraction else []
+        parsed = extraction.parsed if extraction else []
+
+        if len(links) > 2:
+            await message.answer(
+                "Range mode needs a start link and an end link.\n\n" + _GOD_USAGE
+            )
+            return
+
+        if len(links) == 2:
+            clear_god_pending(user_id)
+            await _enqueue_god_range(message, links[0], parsed[0], links[1], parsed[1])
+            return
+
+        if len(links) == 1:
+            set_god_pending(
+                user_id,
+                "range",
+                range_start_link=links[0],
+                range_start_parsed=parsed[0],
+            )
+            await message.answer(
+                f"Range start saved (msg {parsed[0].message_id}). "
+                "Paste the ending t.me message link from the same chat."
+            )
+            return
+
+        set_god_pending(user_id, "range")
+        await message.answer(
+            "Range mode ready. Paste the starting t.me message link "
+            f"(expires in {int(_GOD_PENDING_TTL_SEC // 60)} minutes)."
+        )
+
+    async def _enqueue_god_range(
+        message: Message,
+        start_link: str,
+        start_parsed: ParsedLink,
+        end_link: str,
+        end_parsed: ParsedLink,
+    ) -> None:
+        del end_link
+        if not _same_chat(start_parsed, end_parsed):
+            await message.answer(
+                "Start and end links must be in the same chat. Range not started."
+            )
+            return
+        direction: Literal["up", "down"] = (
+            "up" if end_parsed.message_id >= start_parsed.message_id else "down"
+        )
+        await _enqueue_god_job(
+            message,
+            start_link,
+            direction=direction,
+            parsed=start_parsed,
+            end_id=end_parsed.message_id,
+        )
+
     async def _enqueue_god_job(
         message: Message,
         link: str,
@@ -364,13 +453,19 @@ def create_router(
         parsed: ParsedLink | None,
         cooldown_every: int | None = None,
         cooldown_sec: int | None = None,
+        end_id: int | None = None,
     ) -> None:
         if parsed is None:
             await message.answer("Could not parse that link.")
             return
 
+        span = (
+            f"from msg {parsed.message_id} to {end_id}"
+            if end_id is not None
+            else f"from msg {parsed.message_id}"
+        )
         status_message = await message.answer(
-            f"Queuing god {direction} from msg {parsed.message_id} "
+            f"Queuing god {direction} {span} "
             f"({_cooldown_summary(cooldown_every, cooldown_sec)})…"
         )
         job = DownloadJob(
@@ -383,9 +478,10 @@ def create_router(
             mode="god",
             god_direction=direction,
             god_start_id=parsed.message_id,
+            god_end_id=end_id,
             god_cooldown_every=cooldown_every,
             god_cooldown_sec=cooldown_sec,
-            display_name=f"God {direction} · msg {parsed.message_id}",
+            display_name=f"God {direction} · {span}",
         )
 
         try:
@@ -496,11 +592,16 @@ def create_router(
 
         # Two-step god mode: direction already set, waiting for a link
         if pending is not None:
+            waiting_for = (
+                "ending link"
+                if pending.direction == "range" and pending.range_start_parsed is not None
+                else "starting link"
+                if pending.direction == "range"
+                else "link"
+            )
             if not _LINK_HINT.search(message.text):
                 await message.answer(
-                    f"God mode ({pending.direction}, "
-                    f"{_cooldown_summary(pending.cooldown_every, pending.cooldown_sec)}) "
-                    "is waiting for a link. "
+                    f"God mode ({pending.direction}) is waiting for a {waiting_for}. "
                     "Paste one t.me message link, or /stop to cancel."
                 )
                 return
@@ -522,8 +623,44 @@ def create_router(
                 )
                 return
 
-            clear_god_pending(user_id)
             parsed = extraction.parsed[0] if extraction.parsed else None
+            if pending.direction == "range" and pending.range_start_parsed is None:
+                if parsed is None:
+                    clear_god_pending(user_id)
+                    await message.answer("Could not parse that link.")
+                    return
+                set_god_pending(
+                    user_id,
+                    "range",
+                    range_start_link=extraction.links[0],
+                    range_start_parsed=parsed,
+                )
+                await message.answer(
+                    f"Range start saved (msg {parsed.message_id}). "
+                    "Paste the ending t.me message link from the same chat."
+                )
+                return
+
+            if pending.direction == "range" and pending.range_start_parsed is not None:
+                if parsed is None or pending.range_start_link is None:
+                    clear_god_pending(user_id)
+                    await message.answer("Could not parse that link.")
+                    return
+                clear_god_pending(user_id)
+                await _enqueue_god_range(
+                    message,
+                    pending.range_start_link,
+                    pending.range_start_parsed,
+                    extraction.links[0],
+                    parsed,
+                )
+                return
+
+            if pending.direction not in {"up", "down"}:
+                clear_god_pending(user_id)
+                await message.answer(_GOD_USAGE)
+                return
+            clear_god_pending(user_id)
             await _enqueue_god_job(
                 message,
                 extraction.links[0],

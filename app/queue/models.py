@@ -52,6 +52,7 @@ class DownloadJob:
     mode: Literal["link", "god"] = "link"
     god_direction: Literal["up", "down"] | None = None
     god_start_id: int | None = None
+    god_end_id: int | None = None
     god_cooldown_every: int | None = None
     god_cooldown_sec: int | None = None
     god_scanned: int = 0

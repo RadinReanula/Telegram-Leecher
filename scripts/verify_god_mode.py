@@ -41,6 +41,12 @@ REQUIRED_SNIPPETS: dict[str, list[str]] = {
         "GOD_DELAY_SEC",
         "god_cooldown_every",
         "GOD_COOLDOWN_EVERY",
+        "god_bot_min_interval_sec",
+        "GOD_BOT_MIN_INTERVAL_SEC",
+    ],
+    "app/network/bot_api_gate.py": [
+        "class BotApiGate",
+        "TelegramRetryAfter",
     ],
     "app/main.py": [
         "God mode active",
@@ -88,11 +94,17 @@ def main() -> int:
             errors.append("Invalid GOD_DELAY_SEC in settings")
         if settings.god_cooldown_every < 0 or settings.god_cooldown_sec < 0:
             errors.append("Invalid GOD_COOLDOWN_* in settings")
+        if settings.god_bot_min_interval_sec < 0:
+            errors.append("Invalid GOD_BOT_MIN_INTERVAL_SEC in settings")
+        if not hasattr(DownloadService, "bot_api_gate"):
+            errors.append("DownloadService.bot_api_gate missing")
         from app.downloader.service import _sender_label, _is_connection_error
+        from app.network.bot_api_gate import BotApiGate
 
         assert _is_connection_error(BrokenPipeError())
         assert not _is_connection_error(ValueError("no media"))
         _ = _sender_label  # import smoke
+        _ = BotApiGate(min_interval_sec=1.2, retry_max=2)
     except Exception as exc:
         errors.append(f"Import/runtime check failed: {exc}")
 

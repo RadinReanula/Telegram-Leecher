@@ -71,6 +71,19 @@ After reconnect:
 systemctl is-active telegram-leecher
 ```
 
+## Weekly dependency update
+
+Install once on the VPS (does not replace `telegram-leecher.service`):
+
+```bash
+sudo cp deploy/telegram-leecher-deps.service /etc/systemd/system/
+sudo cp deploy/telegram-leecher-deps.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegram-leecher-deps.timer
+```
+
+The timer runs Saturday 04:00 Asia/Colombo. Results go to `/var/log/telegram-leecher/deps-update.log`. A failed import rolls the venv back and does not restart the bot.
+
 ## Day-to-day commands
 
 | Action | Command |

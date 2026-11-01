@@ -12,7 +12,7 @@ Personal Telegram bot that downloads media from message links using a **Bot API 
 - **Public** channels (`t.me/channel/123`) and **private** supergroups (`t.me/c/.../123`)
 - **Albums** expand fully for single-link and batch jobs (duplicate album links in one batch are skipped)
 - **Typed media delivery** for common formats (video/audio/image documents) on bot and user-session paths ΓÇö no ffmpeg
-- **Large files** delivered via user session (DM) when over bot upload limits (~40–50 MB)
+- **Large files** (> ~40 MB) upload via the user session to Saved Messages, then **forward into the bot chat** in order with smaller files (single, batch, and god mode)
 - **Sender attribution** on normal downloads (`From: @username` in caption; not used in god mode)
 - **Video metadata** and thumbnails on upload (duration, preview tile)
 - **Byte-level progress** in status messages during download (configurable)
@@ -24,7 +24,7 @@ Personal Telegram bot that downloads media from message links using a **Bot API 
 - **`/job <id>`** ΓÇö full detail for one job
 - **`/queue`** ΓÇö global waiting / running counts
 - **`/stop`** ΓÇö cancel **all your** queued and running jobs (including god mode) without restarting the bot
-- **`/god up|down|pause|continue`** ΓÇö crawl a chat by message ID; soft-pause/resume long crawls
+- **`/god up|down|range|pause|continue`** ΓÇö crawl a chat by message ID; bounded range between two links; soft-pause/resume long crawls
 - **FloodWait auto-retry** (configurable; god mode backs off and continues)
 - **Skipped** jobs for links with no media (not treated as failures)
 
@@ -217,6 +217,8 @@ Crawl many messages in one chat without pasting every link. Message IDs generall
 | `/god up <link>` | Start at that message ID and walk **toward newer** IDs |
 | `/god down <link>` | Start at that message ID and walk **toward older** IDs (down to `1`) |
 | `/god up` or `/god down` | Set direction; paste **one** link in the next message (5 min TTL) |
+| `/god range <start> <end>` | Download every message ID between two links in the **same** chat |
+| `/god range` | Paste the start link, then the end link (5 min TTL) |
 | `/god pause` | Soft-pause the active god crawl (use `/god continue` to resume) |
 | `/god continue` | Resume a paused god crawl from the same message ID |
 | `/god` | Show usage |
@@ -225,8 +227,10 @@ Examples: `/god down 150 180 https://t.me/c/…/123` auto-cooldowns every 150 su
 
 - One composite job (not hundreds of queue entries); `/status` and `/job` show crawl counters
 - Skips text-only messages; treats deleted/missing IDs as misses (does not fail the whole run)
-- Expands albums once; later IDs in the same album are skipped
-- `/god up` stops after `GOD_MAX_CONSECUTIVE_MISS` consecutive misses (end of chat)
+- Expands albums once; later IDs in the same album are skipped (album marked seen only after a full group fetch)
+- Retries the same message ID on transient errors (`GOD_ITEM_MAX_RETRIES`); unrecovered IDs are listed in the final status
+- `/god up` stops after `GOD_MAX_CONSECUTIVE_MISS` consecutive misses (end of chat); bounded `/god range` runs until the end link
+- God-mode Bot API sends and status edits are paced (`GOD_BOT_MIN_INTERVAL_SEC`) to reduce private-chat flood limits
 - Delays between IDs (`GOD_DELAY_SEC`), auto-cooldown (`GOD_COOLDOWN_*`), and handles FloodWait inside the crawl
 - Reconnects the user session on connection errors during long crawls
 - `/stop` cancels the crawl ASAP (including while paused)
@@ -301,6 +305,10 @@ Copy [.env.example](.env.example) to `.env`.
 | `GOD_COOLDOWN_EVERY` | `150` | Auto-cooldown after N successful sends (`0` = disable) |
 | `GOD_COOLDOWN_SEC` | `180` | Auto-cooldown length in seconds |
 | `GOD_RECONNECT_MAX_RETRIES` | `5` | Max reconnect attempts after connection loss in god crawl |
+| `GOD_BOT_MIN_INTERVAL_SEC` | `1.2` | Min spacing between god-mode Bot API sends/edits in one chat |
+| `GOD_STATUS_UPDATE_INTERVAL_SEC` | `8` | Min spacing between god crawl status message edits |
+| `GOD_BOT_RETRY_MAX` | `2` | Retries after TelegramRetryAfter on gated Bot API calls |
+| `GOD_ITEM_MAX_RETRIES` | `3` | Retries of the same message ID before god mode records a miss |
 
 **Tips:** Set `ALBUM_PIPELINE=true` for faster multi-photo albums. After first run, private peers stay in `sessions/peer_cache.json`. Try `QUEUE_WORKERS=2` only if you accept more FloodWait risk. Prefer `QUEUE_WORKERS=1` during god mode crawls.
 
@@ -319,10 +327,17 @@ Telegram-Leecher/
 Γöé   Γöé   ΓööΓöÇΓöÇ status_format.py    # /status and status message text
 Γöé   Γö£ΓöÇΓöÇ downloader/             # Pyrogram download, upload, peer cache, god crawl
 Γöé   Γö£ΓöÇΓöÇ parser/                 # t.me link parsing
-Γöé   ΓööΓöÇΓöÇ network/                # Bot HTTPS session (SSL)
+Γöé   ΓööΓöÇΓöÇ network/                # Bot HTTPS session (SSL), god-mode Bot API gate
 Γö£ΓöÇΓöÇ deploy/
 Γöé   Γö£ΓöÇΓöÇ telegram-leecher.service
-Γöé   ΓööΓöÇΓöÇ telegram-leecher.logrotate
+Γöé   Γö£ΓöÇΓöÇ telegram-leecher.logrotate
+Γöé   Γö£ΓöÇΓöÇ telegram-leecher-deps.service
+Γöé   ΓööΓöÇΓöÇ telegram-leecher-deps.timer
+Γö£ΓöÇΓöÇ scripts/
+Γöé   Γö£ΓöÇΓöÇ verify_god_mode.py
+Γöé   ΓööΓöÇΓöÇ weekly_deps_update.sh   # Optional Sat dependency upgrade (see DEPLOY.md)
+Γö£ΓöÇΓöÇ tests/
+Γöé   ΓööΓöÇΓöÇ test_production_features.py
 Γö£ΓöÇΓöÇ DEPLOY.md                   # VPS systemd guide
 Γö£ΓöÇΓöÇ login.py                    # One-time user session auth
 Γö£ΓöÇΓöÇ requirements.txt
@@ -345,7 +360,7 @@ Telegram-Leecher/
 | No user session | Run `python login.py` |
 | Cannot access chat | Join the chat with the login account |
 | FloodWait | Wait; increase `FLOODWAIT_MAX_RETRIES` |
-| File in DM from user session | Normal for large files (> ~40 MB or bot limit) |
+| Large file only in Saved Messages | Update to latest — large files should forward into the bot chat in order |
 | `CERTIFICATE_VERIFY_FAILED` (bot) | Fix system CA / AV HTTPS scanning; last resort `BOT_SSL_VERIFY=false` |
 | Private `t.me/c/...` fails | Open chat in Telegram, restart bot, wait for `Synced N dialog(s)` |
 | Batch only shows ΓÇ£Queued NΓÇ¥ | Update to latest code (batch status message fix) |
@@ -358,7 +373,7 @@ Telegram-Leecher/
 
 ## License
 
-MIT License ΓÇö see [LICENSE](LICENSE).
+GNU GPL v3 ΓÇö see [LICENSE](LICENSE).
 
 ## Author
 

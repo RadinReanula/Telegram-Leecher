@@ -82,8 +82,9 @@ async def run() -> None:
             ]
         )
         logger.info(
-            "God mode active (GOD_DELAY_SEC=%s, GOD_MAX_MESSAGES=%s)",
+            "God mode active (GOD_DELAY_SEC=%s, GOD_BOT_MIN_INTERVAL_SEC=%s, GOD_MAX_MESSAGES=%s)",
             settings.god_delay_sec,
+            settings.god_bot_min_interval_sec,
             settings.god_max_messages,
         )
 

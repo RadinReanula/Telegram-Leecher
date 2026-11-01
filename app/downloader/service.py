@@ -3,7 +3,7 @@ import contextlib
 import logging
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from aiogram import Bot
@@ -28,6 +28,7 @@ from app.downloader.video_metadata import (
     download_video_thumbnail,
     extract_video_params,
 )
+from app.network.bot_api_gate import BotApiGate
 from app.parser.telegram_links import ParsedLink, parse_telegram_link
 from app.queue.exceptions import JobCancelledError
 
@@ -70,6 +71,18 @@ class DownloadService:
         self._settings = settings
         # (requester_id, chat_id, media_group_id) — short-lived album dedupe for batch jobs
         self._claimed_media_groups: dict[tuple[int, int, str], float] = {}
+        self._bot_api_gate = BotApiGate(
+            min_interval_sec=settings.god_bot_min_interval_sec,
+            retry_max=settings.god_bot_retry_max,
+        )
+        # One delivery at a time so batch/album/god order stays stable.
+        self._delivery_lock = asyncio.Lock()
+        self._bot_user_id: int | None = None
+
+    @property
+    def bot_api_gate(self) -> BotApiGate:
+        """Shared gate for god-mode Bot API sends and status edits."""
+        return self._bot_api_gate
 
     async def process_link(
         self,
@@ -156,6 +169,7 @@ class DownloadService:
         is_paused: Callable[[], bool] | None = None,
         cooldown_every: int | None = None,
         cooldown_sec: int | None = None,
+        end_id: int | None = None,
     ) -> DownloadResult:
         def check_cancelled() -> None:
             if is_cancelled and is_cancelled():
@@ -205,7 +219,12 @@ class DownloadService:
             else self._settings.god_cooldown_sec
         )
         max_reconnect = self._settings.god_reconnect_max_retries
+        max_item_retries = self._settings.god_item_max_retries
         reconnect_failures = 0
+        item_attempts: dict[int, int] = {}
+        missed_ids: list[int] = []
+        visited: set[int] = set()
+        bounded = end_id is not None
 
         def make_counters(
             *,
@@ -256,11 +275,20 @@ class DownloadService:
                 await asyncio.sleep(chunk)
                 remaining -= chunk
 
+        def stop_on_miss_streak() -> bool:
+            return (not bounded) and direction == "up" and consecutive_miss >= max_miss
+
+        def remember_attempt(current: int) -> int:
+            item_attempts[current] = item_attempts.get(current, 0) + 1
+            return item_attempts[current]
+
         msg_id = start_id
         while scanned < max_messages:
             check_cancelled()
             progress = min(99, int((scanned / max_messages) * 100)) if max_messages else 0
             await wait_if_paused(msg_id, progress)
+            if _god_id_past_end(msg_id, direction, end_id):
+                break
             if direction == "down" and msg_id < 1:
                 break
 
@@ -290,8 +318,10 @@ class DownloadService:
             except MessageIdInvalid:
                 missing += 1
                 consecutive_miss += 1
-                scanned += 1
-                if direction == "up" and consecutive_miss >= max_miss:
+                if msg_id not in visited:
+                    scanned += 1
+                    visited.add(msg_id)
+                if stop_on_miss_streak():
                     break
                 msg_id = msg_id + 1 if direction == "up" else msg_id - 1
                 await cancellable_sleep(delay, current_id=msg_id, progress=progress)
@@ -299,11 +329,25 @@ class DownloadService:
             except Exception as exc:
                 if not _is_connection_error(exc):
                     if isinstance(exc, RPCError):
-                        logger.warning("God crawl RPC error at msg %s: %s", msg_id, exc)
+                        attempt = remember_attempt(msg_id)
+                        logger.warning(
+                            "God crawl RPC error at msg %s (attempt %s/%s): %s",
+                            msg_id,
+                            attempt,
+                            max_item_retries,
+                            exc,
+                        )
+                        if attempt < max_item_retries:
+                            await cancellable_sleep(delay, current_id=msg_id, progress=progress)
+                            continue
+                        missed_ids.append(msg_id)
+                        item_attempts.pop(msg_id, None)
                         missing += 1
                         consecutive_miss += 1
-                        scanned += 1
-                        if direction == "up" and consecutive_miss >= max_miss:
+                        if msg_id not in visited:
+                            scanned += 1
+                            visited.add(msg_id)
+                        if stop_on_miss_streak():
                             break
                         msg_id = msg_id + 1 if direction == "up" else msg_id - 1
                         await cancellable_sleep(delay, current_id=msg_id, progress=progress)
@@ -331,12 +375,14 @@ class DownloadService:
                 await cancellable_sleep(backoff, current_id=msg_id, progress=progress)
                 continue
 
-            scanned += 1
+            if msg_id not in visited:
+                scanned += 1
+                visited.add(msg_id)
 
             if not message or getattr(message, "empty", False):
                 missing += 1
                 consecutive_miss += 1
-                if direction == "up" and consecutive_miss >= max_miss:
+                if stop_on_miss_streak():
                     break
                 msg_id = msg_id + 1 if direction == "up" else msg_id - 1
                 await cancellable_sleep(delay, current_id=msg_id, progress=progress)
@@ -365,9 +411,15 @@ class DownloadService:
                     except Exception as exc:
                         if _is_connection_error(exc):
                             raise
+                        logger.warning(
+                            "God crawl media group fetch failed at msg %s: %s",
+                            msg_id,
+                            exc,
+                        )
                         media_messages = [message] if message.media else []
-                    if group_id:
-                        seen_groups.add(group_id)
+                    else:
+                        if group_id and skip_seen_groups:
+                            seen_groups.add(group_id)
                 else:
                     media_messages = [message] if message.media else []
             except FloodWait as exc:
@@ -425,6 +477,7 @@ class DownloadService:
                     display_name=item_name,
                     is_cancelled=is_cancelled,
                     include_sender=False,
+                    pace_bot_api=True,
                 )
                 downloaded += delivered
                 if delivered == 0:
@@ -482,15 +535,32 @@ class DownloadService:
                     backoff = min(30, 5 * reconnect_failures)
                     await cancellable_sleep(backoff, current_id=msg_id, progress=progress)
                     continue
-                logger.exception("God crawl failed processing msg %s", msg_id)
+                attempt = remember_attempt(msg_id)
+                logger.exception(
+                    "God crawl failed processing msg %s (attempt %s/%s)",
+                    msg_id,
+                    attempt,
+                    max_item_retries,
+                )
+                if attempt < max_item_retries:
+                    await cancellable_sleep(delay, current_id=msg_id, progress=progress)
+                    continue
+                missed_ids.append(msg_id)
+                item_attempts.pop(msg_id, None)
                 skipped += 1
 
+            item_attempts.pop(msg_id, None)
             msg_id = msg_id + 1 if direction == "up" else msg_id - 1
             await cancellable_sleep(delay, current_id=msg_id, progress=progress)
 
+        missed_note = ""
+        if missed_ids:
+            shown = ", ".join(str(item) for item in missed_ids[:20])
+            extra = "" if len(missed_ids) <= 20 else f" (+{len(missed_ids) - 20} more)"
+            missed_note = f" Unrecovered ids: {shown}{extra}."
         final = (
             f"God {direction} done — scanned {scanned}, sent {downloaded}, "
-            f"skipped {skipped}, missing {missing}."
+            f"skipped {skipped}, missing {missing}.{missed_note}"
         )
         report("uploading", 100, make_counters(current_id=msg_id))
         return DownloadResult(DownloadOutcome.SUCCESS, final, display_name=display_name)
@@ -524,9 +594,11 @@ class DownloadService:
         display_name: str | None,
         is_cancelled: Callable[[], bool] | None = None,
         include_sender: bool = False,
+        pace_bot_api: bool = False,
     ) -> int:
         total = len(media_messages)
-        if total > 1 and self._settings.album_pipeline:
+        # God mode always sequential — overlapping album uploads burst Bot API sends.
+        if total > 1 and self._settings.album_pipeline and not pace_bot_api:
             return await self._process_album_pipelined(
                 media_messages,
                 requester_id=requester_id,
@@ -535,6 +607,7 @@ class DownloadService:
                 display_name=display_name,
                 is_cancelled=is_cancelled,
                 include_sender=include_sender,
+                pace_bot_api=pace_bot_api,
             )
         return await self._process_album_sequential(
             media_messages,
@@ -544,6 +617,7 @@ class DownloadService:
             display_name=display_name,
             is_cancelled=is_cancelled,
             include_sender=include_sender,
+            pace_bot_api=pace_bot_api,
         )
 
     async def _process_album_sequential(
@@ -556,6 +630,7 @@ class DownloadService:
         display_name: str | None,
         is_cancelled: Callable[[], bool] | None = None,
         include_sender: bool = False,
+        pace_bot_api: bool = False,
     ) -> int:
         delivered = 0
         total = len(media_messages)
@@ -571,6 +646,7 @@ class DownloadService:
                 report=report,
                 display_name=display_name,
                 include_sender=include_sender,
+                pace_bot_api=pace_bot_api,
             ):
                 delivered += 1
         return delivered
@@ -585,6 +661,7 @@ class DownloadService:
         display_name: str | None,
         is_cancelled: Callable[[], bool] | None = None,
         include_sender: bool = False,
+        pace_bot_api: bool = False,
     ) -> int:
         total = len(media_messages)
         delivered = 0
@@ -618,6 +695,7 @@ class DownloadService:
                     report=report,
                     display_name=display_name,
                     include_sender=include_sender,
+                    pace_bot_api=pace_bot_api,
                 )
             )
 
@@ -634,6 +712,7 @@ class DownloadService:
         report: Callable[[str, int, str | None], None],
         display_name: str | None,
         include_sender: bool = False,
+        pace_bot_api: bool = False,
     ) -> bool:
         path = await self._download_message(
             message,
@@ -652,6 +731,7 @@ class DownloadService:
             report=report,
             display_name=display_name,
             include_sender=include_sender,
+            pace_bot_api=pace_bot_api,
         )
 
     async def _upload_media_item(
@@ -664,6 +744,7 @@ class DownloadService:
         report: Callable[[str, int, str | None], None],
         display_name: str | None,
         include_sender: bool = False,
+        pace_bot_api: bool = False,
     ) -> bool:
         thumb_path: Path | None = None
         try:
@@ -679,6 +760,7 @@ class DownloadService:
                 message,
                 thumb_path=thumb_path,
                 include_sender=include_sender,
+                pace_bot_api=pace_bot_api,
             )
             return True
         finally:
@@ -837,6 +919,29 @@ class DownloadService:
         *,
         thumb_path: Path | None = None,
         include_sender: bool = False,
+        pace_bot_api: bool = False,
+    ) -> None:
+        async with self._delivery_lock:
+            await self._deliver_file_locked(
+                requester_id,
+                bot_chat_id,
+                path,
+                message,
+                thumb_path=thumb_path,
+                include_sender=include_sender,
+                pace_bot_api=pace_bot_api,
+            )
+
+    async def _deliver_file_locked(
+        self,
+        requester_id: int,
+        bot_chat_id: int,
+        path: Path,
+        message: PyrogramMessage,
+        *,
+        thumb_path: Path | None = None,
+        include_sender: bool = False,
+        pace_bot_api: bool = False,
     ) -> None:
         size = path.stat().st_size
         caption = self._build_caption(message, include_sender=include_sender)
@@ -872,6 +977,7 @@ class DownloadService:
                 caption,
                 request_timeout=timeout,
                 thumb_path=thumb_path,
+                pace_bot_api=pace_bot_api,
             )
         except (TelegramNetworkError, asyncio.TimeoutError, TimeoutError) as exc:
             logger.warning("Bot upload failed (%s), falling back to user session", exc)
@@ -893,13 +999,14 @@ class DownloadService:
         *,
         request_timeout: int | None = None,
         thumb_path: Path | None = None,
+        pace_bot_api: bool = False,
     ) -> None:
         input_file = FSInputFile(path)
         kwargs: dict = {}
         if request_timeout is not None:
             kwargs["request_timeout"] = request_timeout
 
-        try:
+        async def send_typed() -> None:
             await self._send_via_bot_typed(
                 bot_chat_id,
                 input_file,
@@ -908,11 +1015,23 @@ class DownloadService:
                 kwargs=kwargs,
                 thumb_path=thumb_path,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Typed bot send failed (%s), falling back to document", exc)
+
+        async def send_document() -> None:
             await self._bot.send_document(
                 bot_chat_id, input_file, caption=caption, **kwargs
             )
+
+        try:
+            if pace_bot_api:
+                await self._bot_api_gate.run(send_typed)
+            else:
+                await send_typed()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Typed bot send failed (%s), falling back to document", exc)
+            if pace_bot_api:
+                await self._bot_api_gate.run(send_document)
+            else:
+                await send_document()
 
     async def _send_via_bot_typed(
         self,
@@ -967,6 +1086,63 @@ class DownloadService:
 
         await self._bot.send_document(bot_chat_id, input_file, caption=caption, **kwargs)
 
+    async def _cached_bot_user_id(self) -> int:
+        if self._bot_user_id is None:
+            me = await self._bot.get_me()
+            self._bot_user_id = int(me.id)
+        return self._bot_user_id
+
+    async def _user_call_with_retry(self, label: str, factory: Callable[[], Awaitable[object]]):
+        """Retry a user-session call on FloodWait or a dropped connection."""
+        attempts = self._settings.god_item_max_retries
+        last_exc: BaseException | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await factory()
+            except FloodWait as exc:
+                last_exc = exc
+                wait_for = exc.value + self._settings.god_floodwait_extra_sec
+                logger.info(
+                    "%s FloodWait %ss (attempt %s/%s)",
+                    label,
+                    exc.value,
+                    attempt,
+                    attempts,
+                )
+                await asyncio.sleep(wait_for)
+            except Exception as exc:
+                if not _is_connection_error(exc) or attempt >= attempts:
+                    raise
+                last_exc = exc
+                logger.warning(
+                    "%s connection error (attempt %s/%s): %s",
+                    label,
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                await self._ensure_user_connected()
+                await asyncio.sleep(self._settings.god_delay_sec)
+        raise RuntimeError(f"{label} failed after {attempts} attempts") from last_exc
+
+    async def _forward_saved_to_bot(self, saved_message_id: int) -> None:
+        """Copy a Saved Messages upload into the bot chat, in order."""
+        bot_user_id = await self._cached_bot_user_id()
+
+        async def _forward():
+            return await self._user.forward_messages(
+                bot_user_id,
+                "me",
+                saved_message_id,
+            )
+
+        await self._user_call_with_retry("Forward saved file to bot", _forward)
+        logger.info(
+            "Forwarded Saved Messages id %s to bot %s",
+            saved_message_id,
+            bot_user_id,
+        )
+
     async def _send_via_user(
         self,
         requester_id: int,
@@ -976,41 +1152,48 @@ class DownloadService:
         *,
         reason: str,
         thumb_path: Path | None = None,
-    ) -> None:
+    ) -> PyrogramMessage:
+        del requester_id  # large files always land in Saved Messages first
         note = f"File {reason}."
         full_caption = f"{note}\n\n{caption}" if caption else note
 
-        try:
-            await self._send_via_user_typed(
-                requester_id,
-                path,
-                message,
-                full_caption,
-                thumb_path=thumb_path,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Typed user send failed (%s), falling back to document", exc)
-            await self._user.send_document(
-                requester_id, document=str(path), caption=full_caption
-            )
+        async def _save() -> PyrogramMessage:
+            try:
+                return await self._send_via_user_typed(
+                    "me",
+                    path,
+                    message,
+                    full_caption,
+                    thumb_path=thumb_path,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Typed user send failed (%s), falling back to document", exc)
+                return await self._user.send_document(
+                    "me", document=str(path), caption=full_caption
+                )
+
+        saved = await self._user_call_with_retry("Save large file", _save)
+        if saved is None or getattr(saved, "id", None) is None:
+            raise RuntimeError("Saved Messages upload did not return a message id.")
+        await self._forward_saved_to_bot(int(saved.id))
+        return saved
 
     async def _send_via_user_typed(
         self,
-        requester_id: int,
+        chat_id: int | str,
         path: Path,
         message: PyrogramMessage,
         full_caption: str,
         *,
         thumb_path: Path | None = None,
-    ) -> None:
+    ) -> PyrogramMessage:
         if message.video_note:
             note_kwargs: dict = {"caption": full_caption}
             if message.video_note.duration:
                 note_kwargs["duration"] = message.video_note.duration
             if message.video_note.length:
                 note_kwargs["length"] = message.video_note.length
-            await self._user.send_video_note(requester_id, video_note=str(path), **note_kwargs)
-            return
+            return await self._user.send_video_note(chat_id, video_note=str(path), **note_kwargs)
 
         if message.animation or _is_gif_document(message):
             params = extract_video_params(message)
@@ -1019,10 +1202,9 @@ class DownloadService:
                 anim_kwargs["thumb"] = str(thumb_path)
             if params and params.file_name:
                 anim_kwargs["file_name"] = params.file_name
-            await self._user.send_animation(
-                requester_id, animation=str(path), caption=full_caption, **anim_kwargs
+            return await self._user.send_animation(
+                chat_id, animation=str(path), caption=full_caption, **anim_kwargs
             )
-            return
 
         if _is_streamable_video(message):
             params = extract_video_params(message)
@@ -1031,24 +1213,20 @@ class DownloadService:
                 video_kwargs["thumb"] = str(thumb_path)
             if params and params.file_name:
                 video_kwargs["file_name"] = params.file_name
-            await self._user.send_video(
-                requester_id, video=str(path), caption=full_caption, **video_kwargs
+            return await self._user.send_video(
+                chat_id, video=str(path), caption=full_caption, **video_kwargs
             )
-            return
 
         if message.voice:
-            await self._user.send_voice(requester_id, voice=str(path), caption=full_caption)
-            return
+            return await self._user.send_voice(chat_id, voice=str(path), caption=full_caption)
 
         if message.audio or _is_audio_document(message):
-            await self._user.send_audio(requester_id, audio=str(path), caption=full_caption)
-            return
+            return await self._user.send_audio(chat_id, audio=str(path), caption=full_caption)
 
         if message.photo or _is_image_document(message):
-            await self._user.send_photo(requester_id, photo=str(path), caption=full_caption)
-            return
+            return await self._user.send_photo(chat_id, photo=str(path), caption=full_caption)
 
-        await self._user.send_document(requester_id, document=str(path), caption=full_caption)
+        return await self._user.send_document(chat_id, document=str(path), caption=full_caption)
 
     @staticmethod
     def _build_caption(
@@ -1085,6 +1263,14 @@ def _sender_label(message: PyrogramMessage) -> str | None:
             return sender_chat.title
         return f"id {sender_chat.id}"
     return None
+
+
+def _god_id_past_end(msg_id: int, direction: str, end_id: int | None) -> bool:
+    if end_id is None:
+        return False
+    if direction == "up":
+        return msg_id > end_id
+    return msg_id < end_id
 
 
 def _is_connection_error(exc: BaseException) -> bool:

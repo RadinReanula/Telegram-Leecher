@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Telegram Leecher dependency update Saturday 04:00 Asia/Colombo
+
+[Timer]
+OnCalendar=Sat *-*-* 04:00:00
+Timezone=Asia/Colombo
+Persistent=true
+Unit=telegram-leecher-deps.service
+
+[Install]
+WantedBy=timers.target
